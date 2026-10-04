@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Build and publish
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Swift
+        run: swift --version
+
+      - name: Build
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Package and self-test
+        run: |
+          set -euo pipefail
+          bin_dir="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+          stage="$(mktemp -d)"
+          cp "$bin_dir/QuotaBoard" "$stage/QuotaBoard"
+          cp -R "$bin_dir/QuotaBoard_QuotaBoard.bundle" "$stage/QuotaBoard_QuotaBoard.bundle"
+          "$stage/QuotaBoard" --self-test
+          xattr -cr "$stage"
+          COPYFILE_DISABLE=1 ditto --norsrc -c -k "$stage" QuotaBoard-macos.zip
+          file "$stage/QuotaBoard"
+          unzip -l QuotaBoard-macos.zip
+
+      - name: Release name
+        run: echo "RELEASE_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          files: QuotaBoard-macos.zip
+          generate_release_notes: true

@@ -1,5 +1,7 @@
 # Quota Board
 
+[English](README.en.md)
+
 macOS 菜单栏里的剩余额度。读取这台机器上已经登录的 Claude、Codex、Cursor 和 Grok，也读取 `sub2api`、`new-api` 和 CPA 上的 Codex 账号。每张卡显示最紧的窗口还剩多少、何时重置，以及下一次账单日。
 
 额度接口是这些客户端自己在用的接口，字段并不稳定。读数失败时，卡片沿用上次成功的结果。
@@ -147,3 +149,20 @@ Codex 卡片可以改名或移除，入口在名称旁边的菜单里。名称�
 `sort` 取 `expiry` 或 `name`。缺省或无法识别时按到期排。`expiry` 按最近的额度重置时间从近到远。`name` 按当前显示名称排序。
 
 Claude、Cursor 和 Grok 的卡片菜单里只有账单日。
+
+## 发布
+
+推送 `v*` 标签后，GitHub Actions 会编译 macOS 通用二进制，并发布到 [Releases](https://github.com/yixian-huang/quota-board/releases)。第一个版本是 [0.0.1](https://github.com/yixian-huang/quota-board/releases/tag/v0.0.1)。
+
+压缩包里是 `QuotaBoard` 和旁边的 `QuotaBoard_QuotaBoard.bundle`。两者要留在同一目录：
+
+```sh
+unzip QuotaBoard-macos.zip
+./QuotaBoard
+```
+
+从浏览器下载时，macOS 可能拦住这个程序。在同一目录执行 `xattr -d com.apple.quarantine QuotaBoard` 后再打开。
+
+## 许可证
+
+[MIT](LICENSE)
