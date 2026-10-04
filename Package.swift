@@ -10,6 +10,9 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "QuotaBoard",
+            resources: [
+                .process("Resources")
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
             ]

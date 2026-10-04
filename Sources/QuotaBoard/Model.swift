@@ -31,9 +31,11 @@ struct ProviderSnapshot: Identifiable, Sendable, Equatable {
     let error: String?
     /// Previous reading kept after a failed refresh.
     let isStale: Bool
-    /// Stable key for a hand-set billing day. Nil uses `id`.
+    /// Stable key for a hand-set billing day or account name. Nil uses `id`.
     var billingKey: String? = nil
     var billing: BillingAnchor? = nil
+    /// A saved name replaces the upstream label until cleared.
+    var nameIsManual: Bool = false
 
     var billingIdentity: String { billingKey ?? id }
 
@@ -48,6 +50,22 @@ struct ProviderSnapshot: Identifiable, Sendable, Equatable {
             copy.billingKey = billingKey
         }
         return copy
+    }
+
+    func renamed(_ name: String, manual: Bool) -> ProviderSnapshot {
+        ProviderSnapshot(
+            id: id,
+            name: name,
+            shortName: name,
+            plan: plan,
+            windows: windows,
+            note: note,
+            error: error,
+            isStale: isStale,
+            billingKey: billingKey,
+            billing: billing,
+            nameIsManual: manual
+        )
     }
 
     var dumpLine: String {
@@ -166,6 +184,114 @@ enum BillingStore {
     }
 }
 
+enum BoardSort: String, Equatable, Sendable {
+    case expiry
+    case name
+}
+
+enum BoardOrder {
+    /// The next time this card's quota actually refreshes. A reset already in the past does not count.
+    static func upcomingReset(_ snapshot: ProviderSnapshot, now: Date) -> Date? {
+        snapshot.windows.compactMap(\.resetsAt).filter { $0 > now }.min()
+    }
+
+    static func arrange(_ snapshots: [ProviderSnapshot], sort: BoardSort, now: Date) -> [ProviderSnapshot] {
+        switch sort {
+        case .name:
+            return snapshots.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        case .expiry:
+            return snapshots.sorted { lhs, rhs in
+                switch (upcomingReset(lhs, now: now), upcomingReset(rhs, now: now)) {
+                case let (left?, right?) where left != right:
+                    return left < right
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+            }
+        }
+    }
+}
+
+struct AccountDirectory: Equatable, Sendable {
+    var names: [String: String] = [:]
+    var hidden: Set<String> = []
+    var sort: BoardSort = .expiry
+
+    static let nameLimit = 32
+
+    static func normalize(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= nameLimit else { return nil }
+        return trimmed
+    }
+
+    func apply(_ snapshots: [ProviderSnapshot], now: Date = .now) -> (visible: [ProviderSnapshot], hidden: [ProviderSnapshot]) {
+        var visible: [ProviderSnapshot] = []
+        var hiddenSnapshots: [ProviderSnapshot] = []
+        for snapshot in snapshots {
+            let key = snapshot.billingIdentity
+            let named = names[key].map { snapshot.renamed($0, manual: true) } ?? snapshot
+            if hidden.contains(key) {
+                hiddenSnapshots.append(named)
+            } else {
+                visible.append(named)
+            }
+        }
+        return (
+            BoardOrder.arrange(visible, sort: sort, now: now),
+            BoardOrder.arrange(hiddenSnapshots, sort: .name, now: now)
+        )
+    }
+}
+
+enum AccountStore {
+    static func fileURL(home: URL = CredentialPaths.home) -> URL {
+        home.appendingPathComponent(".quota-board/accounts.json")
+    }
+
+    static func load(from url: URL = fileURL()) -> AccountDirectory {
+        guard let data = try? Data(contentsOf: url) else { return AccountDirectory() }
+        return parse(data)
+    }
+
+    static func parse(_ data: Data) -> AccountDirectory {
+        guard let object = try? JSONValue.object(from: data) else { return AccountDirectory() }
+        var names: [String: String] = [:]
+        if let raw = object["names"] as? [String: Any] {
+            for (key, value) in raw {
+                guard !key.isEmpty, let text = JSONValue.string(value), let name = AccountDirectory.normalize(text) else {
+                    continue
+                }
+                names[key] = name
+            }
+        }
+        var hidden: Set<String> = []
+        if let raw = object["hidden"] as? [Any] {
+            for value in raw {
+                guard let key = JSONValue.string(value), !key.isEmpty else { continue }
+                hidden.insert(key)
+            }
+        }
+        let sort = JSONValue.string(object["sort"]).flatMap(BoardSort.init(rawValue:)) ?? .expiry
+        return AccountDirectory(names: names, hidden: hidden, sort: sort)
+    }
+
+    static func save(_ directory: AccountDirectory, to url: URL = fileURL()) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let object: [String: Any] = [
+            "hidden": directory.hidden.sorted(),
+            "names": directory.names,
+            "sort": directory.sort.rawValue,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
+    }
+}
+
 enum Format {
     static func percent(_ value: Double) -> String {
         "\(Int(value.rounded()))%"
@@ -221,23 +347,64 @@ enum Format {
         }
         return "\(word) \(month)月\(day)日"
     }
+
+    /// The calendar date on a billing row. `emphasized` marks a day that is already here or less than a week away.
+    static func billingFace(
+        _ anchor: BillingAnchor?,
+        now: Date = .now,
+        calendar: Calendar = .current
+    ) -> (text: String, emphasized: Bool) {
+        guard let anchor else { return ("未设置", false) }
+        let next = BillingCalendar.next(anchor: anchor.at, renews: anchor.renews, now: now, calendar: calendar)
+        let today = calendar.startOfDay(for: now)
+        let days = calendar.dateComponents([.day], from: today, to: calendar.startOfDay(for: next)).day ?? 0
+        let month = calendar.component(.month, from: next)
+        let day = calendar.component(.day, from: next)
+        let year = calendar.component(.year, from: next)
+        let text = year == calendar.component(.year, from: now)
+            ? "\(month)月\(day)日"
+            : "\(year)年\(month)月\(day)日"
+        let lapsed = anchor.renews == false && calendar.startOfDay(for: next) < today
+        return (text, lapsed || days < 7)
+    }
 }
 
 enum MenuTitle {
-    /// Menu bar shows every provider under 50% remaining, otherwise only the tightest one.
-    static func text(for snapshots: [ProviderSnapshot]) -> String {
-        let ranked = snapshots.compactMap { snapshot -> (String, Int)? in
-            guard let window = snapshot.tightest else { return nil }
-            return (snapshot.shortName, Int(window.remainingPercent.rounded()))
-        }
-        .sorted { $0.1 < $1.1 }
+    struct Item: Equatable {
+        var name: String
+        var percent: Int
+        var kind: Mark.Kind?
+    }
 
-        if ranked.isEmpty {
+    /// The window that refreshes soonest. With no future reset, the lowest remaining quota.
+    static func item(for snapshots: [ProviderSnapshot], now: Date = .now) -> Item? {
+        let pairs = snapshots.flatMap { snapshot in
+            snapshot.windows.map { (snapshot, $0) }
+        }
+        guard !pairs.isEmpty else { return nil }
+        let upcoming = pairs.filter { ($0.1.resetsAt ?? .distantPast) > now }
+        let pool = upcoming.isEmpty ? pairs : upcoming
+        guard let chosen = pool.min(by: { a, b in
+            if !upcoming.isEmpty, let left = a.1.resetsAt, let right = b.1.resetsAt, left != right {
+                return left < right
+            }
+            if a.1.remainingPercent != b.1.remainingPercent {
+                return a.1.remainingPercent < b.1.remainingPercent
+            }
+            return false
+        }) else { return nil }
+        return Item(
+            name: chosen.0.shortName,
+            percent: Int(chosen.1.remainingPercent.rounded()),
+            kind: Mark.kind(for: chosen.0)
+        )
+    }
+
+    static func text(for snapshots: [ProviderSnapshot], now: Date = .now) -> String {
+        guard let item = item(for: snapshots, now: now) else {
             return snapshots.contains { $0.error != nil } ? "额度不可用" : "读取中"
         }
-        let pressing = ranked.filter { $0.1 < 50 }
-        let shown = pressing.isEmpty ? [ranked[0]] : pressing
-        return shown.map { "\($0.0) \($0.1)%" }.joined(separator: " · ")
+        return "\(item.name) \(item.percent)%"
     }
 }
 

@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 enum SelfTest {
     static func run() -> Int {
@@ -79,15 +79,79 @@ enum SelfTest {
             failures.append("parse threw \(error)")
         }
 
-        let menu = MenuTitle.text(for: [
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let hour = now.addingTimeInterval(3_600)
+        let day = now.addingTimeInterval(86_400)
+        let past = now.addingTimeInterval(-3_600)
+        let soonest = [
+            sample("claude", "Claude", used: 10, resetsAt: day),
+            sample("codex", "Codex", used: 4, resetsAt: hour),
+            sample("cursor", "Cursor", used: 86, resetsAt: day.addingTimeInterval(3_600)),
+            sample("grok", "Grok", used: 71, resetsAt: day),
+        ]
+        let menu = MenuTitle.text(for: soonest, now: now)
+        check(menu == "Codex 96%", "soonest menu \(menu)")
+        check(MenuTitle.item(for: soonest, now: now)?.kind == .codex, "soonest mark")
+        let bar = MenuBarTitle.attributed(soonest, now: now).string
+        check(bar.contains("96%") && !bar.contains("90%"), "menu bar \(bar)")
+
+        let undated = MenuTitle.text(for: [
             sample("claude", "Claude", used: 10),
             sample("codex", "Codex", used: 4),
             sample("cursor", "Cursor", used: 86),
             sample("grok", "Grok", used: 71),
-        ])
-        check(menu == "Cursor 14% · Grok 29%", "menu \(menu)")
+        ], now: now)
+        check(undated == "Cursor 14%", "undated menu \(undated)")
 
-        let healthy = MenuTitle.text(for: [sample("codex", "Codex", used: 4)])
+        let split = ProviderSnapshot(
+            id: "codex", name: "Codex", shortName: "Codex", plan: nil,
+            windows: [
+                QuotaWindow(id: "5h", label: "5 小时", usedPercent: 80, resetsAt: hour),
+                QuotaWindow(id: "week", label: "每周", usedPercent: 4, resetsAt: day),
+            ],
+            note: nil, error: nil, isStale: false
+        )
+        let splitMenu = MenuTitle.text(for: [split], now: now)
+        check(splitMenu == "Codex 20%", "soonest window \(splitMenu)")
+
+        let onlyPast = MenuTitle.text(for: [
+            sample("claude", "Claude", used: 10, resetsAt: past),
+            sample("cursor", "Cursor", used: 86, resetsAt: past),
+        ], now: now)
+        check(onlyPast == "Cursor 14%", "past falls back \(onlyPast)")
+
+        let futureWins = MenuTitle.text(for: [
+            sample("cursor", "Cursor", used: 86, resetsAt: past),
+            sample("grok", "Grok", used: 71, resetsAt: hour),
+        ], now: now)
+        check(futureWins == "Grok 29%", "future beats past \(futureWins)")
+
+        let tied = MenuTitle.text(for: [
+            sample("claude", "Claude", used: 40, resetsAt: hour),
+            sample("codex", "Codex", used: 10, resetsAt: hour),
+        ], now: now)
+        check(tied == "Claude 60%", "tied reset \(tied)")
+
+        check(MenuTitle.text(for: [], now: now) == "读取中", "empty menu")
+        check(MenuTitle.text(for: [ProviderSnapshot(
+            id: "x", name: "X", shortName: "X", plan: nil, windows: [],
+            note: nil, error: "失败", isStale: false
+        )], now: now) == "额度不可用", "error menu")
+
+        check(Mark.icon(.board, side: 16).size == NSSize(width: 16, height: 16), "board icon")
+        for name in ["claude", "codex", "cursor", "cursor-dark", "grok"] {
+            check(Bundle.module.url(forResource: name, withExtension: "png") != nil, "icon \(name)")
+        }
+        for kind in [Mark.Kind.claude, .codex, .cursor, .grok] {
+            let icon = Mark.icon(kind, side: 16)
+            check(icon.size == NSSize(width: 16, height: 16), "icon size \(kind)")
+            check((icon.tiffRepresentation?.count ?? 0) > 1000, "icon pixels \(kind)")
+        }
+        let darkCursor = Mark.icon(.cursor, side: 16, appearance: NSAppearance(named: .darkAqua))
+        let lightCursor = Mark.icon(.cursor, side: 16, appearance: NSAppearance(named: .aqua))
+        check(darkCursor.tiffRepresentation != lightCursor.tiffRepresentation, "cursor appearance")
+
+        let healthy = MenuTitle.text(for: [sample("codex", "Codex", used: 4)], now: now)
         check(healthy == "Codex 96%", "healthy menu \(healthy)")
 
         let merged = mergeSnapshots(
@@ -294,6 +358,86 @@ enum SelfTest {
         }
         try? FileManager.default.removeItem(at: file)
 
+        let namedAccount = sample("codex-a", "work", used: 4).replacing(billing: nil, billingKey: "acct:acct-a")
+        let droppedAccount = sample("codex-b", "Codex 2", used: 80).replacing(billing: nil, billingKey: "acct:acct-b")
+        let directory = AccountDirectory(names: ["acct:acct-a": "公司号"], hidden: ["acct:acct-b"])
+        let listed = directory.apply([namedAccount, droppedAccount])
+        check(listed.visible.map(\.name) == ["公司号"] && listed.visible[0].nameIsManual, "renamed account")
+        check(listed.visible[0].shortName == "公司号", "menu uses the saved name")
+        check(listed.hidden.map(\.billingIdentity) == ["acct:acct-b"], "hidden account")
+        check(MenuTitle.text(for: listed.visible, now: now) == "公司号 96%", "hidden leaves the menu \(MenuTitle.text(for: listed.visible, now: now))")
+        let accountsFile = FileManager.default.temporaryDirectory.appendingPathComponent("quota-board-accounts-\(UUID().uuidString).json")
+        do {
+            try AccountStore.save(directory, to: accountsFile)
+            let loaded = AccountStore.load(from: accountsFile)
+            check(loaded == directory, "account file roundtrip")
+        } catch {
+            failures.append("account file threw \(error)")
+        }
+        try? FileManager.default.removeItem(at: accountsFile)
+        let parsed = AccountStore.parse(Data("""
+        {"names":{"acct:a":"  公司号  ","acct:b":"","acct:c":"123456789012345678901234567890123"},"hidden":["acct:z", 4]}
+        """.utf8))
+        check(parsed.names == ["acct:a": "公司号"], "account names \(parsed.names)")
+        check(parsed.hidden == ["acct:z"], "account hidden \(parsed.hidden)")
+        check(parsed.sort == .expiry, "missing sort defaults to expiry")
+        check(AccountDirectory.normalize("   ") == nil && AccountDirectory.normalize(String(repeating: "名", count: 33)) == nil, "name limits")
+
+        let resetHour = october.addingTimeInterval(3_600)
+        let resetDay = october.addingTimeInterval(86_400)
+        let resetPast = october.addingTimeInterval(-3_600)
+        let near = sample("near", "near", used: 10, resetsAt: resetHour)
+        let far = sample("far", "far", used: 20, resetsAt: resetDay)
+        let tiedAlpha = sample("alpha", "alpha", used: 1, resetsAt: resetHour)
+        let tiedBeta = sample("beta", "beta", used: 2, resetsAt: resetHour)
+        let staleCard = sample("stale", "zeta", used: 30, resetsAt: resetPast)
+        let blank = sample("blank", "mid", used: 40)
+        let exact = sample("exact", "exact", used: 5, resetsAt: october)
+        let multi = ProviderSnapshot(
+            id: "multi",
+            name: "multi",
+            shortName: "multi",
+            plan: nil,
+            windows: [
+                QuotaWindow(id: "week", label: "每周", usedPercent: 4, resetsAt: resetDay.addingTimeInterval(86_400)),
+                QuotaWindow(id: "5h", label: "5 小时", usedPercent: 80, resetsAt: resetHour.addingTimeInterval(-1_800)),
+            ],
+            note: nil,
+            error: nil,
+            isStale: false
+        )
+        let expiryOrder = BoardOrder.arrange(
+            [far, blank, staleCard, near, tiedAlpha, tiedBeta, exact, multi],
+            sort: .expiry,
+            now: october
+        )
+        check(
+            expiryOrder.map(\.id) == ["multi", "alpha", "beta", "near", "far", "exact", "blank", "stale"],
+            "expiry order \(expiryOrder.map(\.id))"
+        )
+        let nameOrder = BoardOrder.arrange([far, near, blank], sort: .name, now: october)
+        check(nameOrder.map(\.id) == ["far", "blank", "near"], "name order \(nameOrder.map(\.id))")
+        let byName = AccountDirectory(sort: .name).apply([far, near], now: october)
+        check(byName.visible.map(\.id) == ["far", "near"], "directory name sort")
+        check(AccountDirectory().apply([far, near], now: october).visible.map(\.id) == ["near", "far"], "directory expiry sort")
+        let namedSort = AccountStore.parse(Data(#"{"sort":"name"}"#.utf8))
+        check(namedSort.sort == .name, "saved name sort")
+        let unknownSort = AccountStore.parse(Data(#"{"sort":"plan"}"#.utf8))
+        check(unknownSort.sort == .expiry, "unknown sort falls back")
+
+        let unsetFace = Format.billingFace(nil, now: october, calendar: calendar)
+        check(unsetFace.text == "未设置" && unsetFace.emphasized == false, "unset billing face")
+        let distantFace = Format.billingFace(monthly, now: october, calendar: calendar)
+        check(distantFace.text == "10月16日" && distantFace.emphasized == false, "distant billing face \(distantFace)")
+        let closeFace = Format.billingFace(soon, now: october, calendar: calendar)
+        check(closeFace.text == "10月8日" && closeFace.emphasized, "close billing face \(closeFace)")
+        let todayFace = Format.billingFace(BillingAnchor(at: october, renews: nil, manual: false), now: october, calendar: calendar)
+        check(todayFace.text == "10月4日" && todayFace.emphasized, "today billing face \(todayFace)")
+        let lapsedFace = Format.billingFace(lapsed, now: october, calendar: calendar)
+        check(lapsedFace.text == "9月16日" && lapsedFace.emphasized, "lapsed billing face \(lapsedFace)")
+        let yearFace = Format.billingFace(nextYear, now: october, calendar: calendar)
+        check(yearFace.text == "2027年1月16日" && yearFace.emphasized == false, "year billing face \(yearFace)")
+
         if failures.isEmpty {
             print("self-test ok")
             return 0
@@ -348,13 +492,13 @@ enum SelfTest {
         )
     }
 
-    private static func sample(_ id: String, _ name: String, used: Double) -> ProviderSnapshot {
+    private static func sample(_ id: String, _ name: String, used: Double, resetsAt: Date? = nil) -> ProviderSnapshot {
         ProviderSnapshot(
             id: id,
             name: name,
             shortName: name,
             plan: nil,
-            windows: [QuotaWindow(id: "\(id)-main", label: "每周", usedPercent: used, resetsAt: nil)],
+            windows: [QuotaWindow(id: "\(id)-main", label: "每周", usedPercent: used, resetsAt: resetsAt)],
             note: nil,
             error: nil,
             isStale: false
