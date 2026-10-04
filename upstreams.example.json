@@ -1,0 +1,23 @@
+{
+  "upstreams": [
+    {
+      "kind": "sub2api",
+      "name": "sub2api",
+      "baseURL": "https://your-sub2api.example",
+      "keychainAccount": "sub2api"
+    },
+    {
+      "kind": "new-api",
+      "name": "new-api",
+      "baseURL": "https://your-new-api.example",
+      "userID": "1",
+      "keychainAccount": "new-api"
+    },
+    {
+      "kind": "cpa",
+      "name": "cpa",
+      "baseURL": "https://your-cpa.example",
+      "keychainAccount": "cpa"
+    }
+  ]
+}
