@@ -268,6 +268,13 @@ enum SelfTest {
         check(proUsage[0].snapshot.plan == "Pro 200" && proUsage[0].snapshot.windows.map(\.label) == ["每周"], "pro 200 drops 5h")
         check(proUsage[1].snapshot.windows.map(\.label) == ["每周"], "zero-length 5h dropped")
         check(proUsage[2].snapshot.windows.map(\.label) == ["5 小时", "每周"], "real 5h kept")
+        let apiKey = Sub2APICodex.authHeaders("  admin-key  ")
+        check(apiKey["x-api-key"] == "admin-key" && apiKey["Authorization"] == nil, "sub2api api key header")
+        let dotted = Sub2APICodex.authHeaders("not.a.jwt")
+        check(dotted["x-api-key"] == "not.a.jwt" && dotted["Authorization"] == nil, "dotted secret stays an api key")
+        let jwt = "eyJhbGciOiJub25lIn0.eyJ4IjoxfQ.x"
+        let bearer = Sub2APICodex.authHeaders("Bearer \(jwt)")
+        check(bearer["Authorization"] == "Bearer \(jwt)" && bearer["x-api-key"] == nil, "sub2api jwt header")
 
         let channels = try NewAPICodex.parsePage(Data("""
         {"success":true,"data":{"total":1,"items":[{"id":3,"name":"desk","type":57,"status":1,"key":"secret-key"}]}}

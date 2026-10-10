@@ -536,9 +536,37 @@ enum Sub2APICodex {
         )
     }
 
-    private static func authHeaders(_ secret: String) -> [String: String] {
-        let value = secret.lowercased().hasPrefix("bearer ") ? secret : "Bearer \(secret)"
-        return ["Authorization": value, "Accept": "application/json"]
+    /// A present `x-api-key` is the only credential sub2api checks. A JWT stays on
+    /// `Authorization`, so an expired login is not rejected as an admin key.
+    static func authHeaders(_ secret: String) -> [String: String] {
+        var token = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.lowercased().hasPrefix("bearer ") {
+            token = String(token.dropFirst("bearer ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if looksLikeJWT(token) {
+            return ["Authorization": "Bearer \(token)", "Accept": "application/json"]
+        }
+        return ["x-api-key": token, "Accept": "application/json"]
+    }
+
+    private static func looksLikeJWT(_ token: String) -> Bool {
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts.allSatisfy({ !$0.isEmpty }) else { return false }
+        guard
+            let data = base64URL(String(parts[0])),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            JSONValue.string(object["alg"])?.isEmpty == false
+        else { return false }
+        return true
+    }
+
+    private static func base64URL(_ text: String) -> Data? {
+        var encoded = text.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        let remainder = encoded.count % 4
+        if remainder != 0 {
+            encoded.append(String(repeating: "=", count: 4 - remainder))
+        }
+        return Data(base64Encoded: encoded)
     }
 }
 
