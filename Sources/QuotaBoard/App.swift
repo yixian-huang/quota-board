@@ -47,14 +47,42 @@ final class QuotaStore {
         Task { await loop() }
     }
 
-    func refresh() async {
+    func refresh(userInitiated: Bool = false) async {
         guard !isRefreshing else { return }
         isRefreshing = true
         publish()
-        let fresh = await QuotaService.fetchAll()
-        fetched = mergeSnapshots(previous: fetched, fresh: fresh)
+        let baseline = fetched
+        let fresh = await QuotaService.fetchAll(
+            force: userInitiated,
+            onUpdate: { @MainActor snapshot in
+                self.integrate(snapshot, baseline: baseline)
+            },
+            onCodex: { @MainActor snapshots in
+                self.integrateCodex(snapshots, baseline: baseline)
+            }
+        )
+        fetched = mergeSnapshots(previous: baseline, fresh: fresh)
         lastUpdated = Date()
         isRefreshing = false
+        overlay()
+        publish()
+    }
+
+    private func integrate(_ snapshot: ProviderSnapshot, baseline: [ProviderSnapshot]) {
+        var next = fetched
+        if let index = next.firstIndex(where: { $0.id == snapshot.id }) {
+            next[index] = snapshot
+        } else {
+            next.append(snapshot)
+        }
+        fetched = mergeSnapshots(previous: baseline, fresh: next)
+        overlay()
+        publish()
+    }
+
+    private func integrateCodex(_ snapshots: [ProviderSnapshot], baseline: [ProviderSnapshot]) {
+        let kept = fetched.filter { $0.id != "codex" && !$0.id.hasPrefix("codex-") }
+        fetched = mergeSnapshots(previous: baseline, fresh: kept + snapshots)
         overlay()
         publish()
     }
@@ -222,6 +250,12 @@ final class PanelController: NSViewController {
     weak var popover: NSPopover?
     private let root = NSStackView()
     private let cards = NSStackView()
+    private let scrollView = NSScrollView()
+    private var scrollHeightConstraint: NSLayoutConstraint?
+    private var headerRow: NSView?
+    private var topSeparator: NSView?
+    private var bottomSeparator: NSView?
+    private var footerRow: NSView?
     private let sortButton = NSPopUpButton(frame: .zero, pullsDown: false)
     private let updatedLabel = NSTextField(labelWithString: "等待第一次读取")
     private let refreshButton = NSButton()
@@ -235,6 +269,15 @@ final class PanelController: NSViewController {
     private weak var draftField: NSTextField?
     private var accountErrorKey: String?
     private var accountError: String?
+    private var hasRendered = false
+    private var renderedSnapshots: [ProviderSnapshot] = []
+    private var renderedHidden: [ProviderSnapshot] = []
+    private var renderedEditing: String?
+    private var renderedNaming: String?
+    private var renderedEditError: String?
+    private var renderedNameError: String?
+    private var renderedAccountErrorKey: String?
+    private var renderedAccountError: String?
 
     init(store: QuotaStore) {
         self.store = store
@@ -263,6 +306,28 @@ final class PanelController: NSViewController {
         cards.orientation = .vertical
         cards.alignment = .leading
         cards.spacing = 6
+        cards.setContentHuggingPriority(.required, for: .vertical)
+        cards.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.scrollerStyle = .overlay
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentView.drawsBackground = false
+        scrollView.documentView = cards
+        cards.translatesAutoresizingMaskIntoConstraints = false
+        let scrollHeight = scrollView.heightAnchor.constraint(equalToConstant: 120)
+        scrollHeight.isActive = true
+        scrollHeightConstraint = scrollHeight
+        NSLayoutConstraint.activate([
+            cards.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            cards.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            cards.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+        ])
 
         updatedLabel.font = .systemFont(ofSize: 11)
         updatedLabel.textColor = .secondaryLabelColor
@@ -292,11 +357,19 @@ final class PanelController: NSViewController {
         let footer = NSStackView(views: [updatedLabel, NSView(), quit])
         footer.orientation = .horizontal
         footer.alignment = .centerY
+        footerRow = footer
 
-        root.addArrangedSubview(header())
-        root.addArrangedSubview(separator())
-        root.addArrangedSubview(cards)
-        root.addArrangedSubview(separator())
+        let header = header()
+        headerRow = header
+        let topRule = separator()
+        topSeparator = topRule
+        let bottomRule = separator()
+        bottomSeparator = bottomRule
+
+        root.addArrangedSubview(header)
+        root.addArrangedSubview(topRule)
+        root.addArrangedSubview(scrollView)
+        root.addArrangedSubview(bottomRule)
         root.addArrangedSubview(footer)
 
         NSLayoutConstraint.activate([
@@ -304,33 +377,16 @@ final class PanelController: NSViewController {
             root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
             root.topAnchor.constraint(equalTo: background.topAnchor),
             root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
-            cards.widthAnchor.constraint(equalToConstant: 336),
+            scrollView.widthAnchor.constraint(equalToConstant: 336),
             footer.widthAnchor.constraint(equalToConstant: 336),
         ])
         reload()
     }
 
     func reload() {
+        commitBillingDraft()
         if let draftField {
             draftName = draftField.stringValue
-        }
-        for view in cards.arrangedSubviews {
-            cards.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        if store.snapshots.isEmpty && store.hidden.isEmpty {
-            cards.addArrangedSubview(text(
-                store.isRefreshing ? "正在读取本机登录…" : "还没有额度数据",
-                size: 13,
-                color: .secondaryLabelColor
-            ))
-        } else {
-            for snapshot in store.snapshots {
-                cards.addArrangedSubview(card(snapshot))
-            }
-            if !store.hidden.isEmpty {
-                cards.addArrangedSubview(hiddenSection())
-            }
         }
         updatedLabel.stringValue = store.lastUpdated.map { Format.updated($0) } ?? "等待第一次读取"
         refreshButton.isEnabled = !store.isRefreshing
@@ -338,24 +394,107 @@ final class PanelController: NSViewController {
         if sortButton.indexOfSelectedItem != sortIndex {
             sortButton.selectItem(at: sortIndex)
         }
-        view.layoutSubtreeIfNeeded()
-        let fitted = ceil(root.fittingSize.height)
-        let height = (fitted >= 140 && fitted <= 640) ? fitted : fallbackHeight()
-        preferredContentSize = NSSize(width: 360, height: height)
-        if namingKey != nil, let draftField {
+        let unchanged = hasRendered
+            && store.snapshots == renderedSnapshots
+            && store.hidden == renderedHidden
+            && editingKey == renderedEditing
+            && namingKey == renderedNaming
+            && editError == renderedEditError
+            && nameError == renderedNameError
+            && accountErrorKey == renderedAccountErrorKey
+            && accountError == renderedAccountError
+        if !unchanged {
+            for view in cards.arrangedSubviews {
+                cards.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            if store.snapshots.isEmpty && store.hidden.isEmpty {
+                cards.addArrangedSubview(text(
+                    store.isRefreshing ? "正在读取本机登录…" : "还没有额度数据",
+                    size: 13,
+                    color: .secondaryLabelColor
+                ))
+            } else {
+                for snapshot in store.snapshots {
+                    cards.addArrangedSubview(card(snapshot))
+                }
+                if !store.hidden.isEmpty {
+                    cards.addArrangedSubview(hiddenSection())
+                }
+            }
+            renderedSnapshots = store.snapshots
+            renderedHidden = store.hidden
+            renderedEditing = editingKey
+            renderedNaming = namingKey
+            renderedEditError = editError
+            renderedNameError = nameError
+            renderedAccountErrorKey = accountErrorKey
+            renderedAccountError = accountError
+            hasRendered = true
+        }
+        fitPopover()
+        if !unchanged, namingKey != nil, let draftField {
             DispatchQueue.main.async { [weak self] in
                 self?.view.window?.makeFirstResponder(draftField)
             }
         }
     }
 
+    private func commitBillingDraft() {
+        guard let draftPicker else { return }
+        // The Save button does not resign the field editor, so the typed day is still in the editor.
+        draftPicker.validateEditing()
+        if let editor = draftPicker.currentEditor() {
+            draftPicker.endEditing(editor)
+        }
+        draftDate = draftPicker.dateValue
+    }
+
+    private func fitPopover() {
+        let screenHeight = (view.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        let maximumHeight = screenHeight - 48
+        view.layoutSubtreeIfNeeded()
+        let insets = root.edgeInsets.top + root.edgeInsets.bottom
+        let chrome = chromeHeight()
+        var contentHeight = cardsContentHeight()
+        if contentHeight <= 1 {
+            contentHeight = max(0, fallbackHeight() - chrome - insets)
+        }
+        let scroll = min(contentHeight, max(120, maximumHeight - chrome - insets))
+        var preferred = chrome + scroll + insets
+        if preferred < 140 { preferred = 140 }
+        if preferred > maximumHeight { preferred = maximumHeight }
+        scrollHeightConstraint?.constant = max(0, preferred - chrome - insets)
+        view.layoutSubtreeIfNeeded()
+        preferredContentSize = NSSize(width: 360, height: preferred)
+    }
+
+    private func cardsContentHeight() -> CGFloat {
+        let fitted = cards.fittingSize.height
+        let intrinsic = cards.intrinsicContentSize.height
+        if intrinsic > 1 {
+            return max(fitted, intrinsic)
+        }
+        return fitted
+    }
+
+    private func chromeHeight() -> CGFloat {
+        let measured = [headerRow, topSeparator, bottomSeparator, footerRow].reduce(CGFloat(0)) { sum, part in
+            sum + (part?.fittingSize.height ?? 0)
+        }
+        if measured <= 1 { return 88 }
+        return measured + root.spacing * 4
+    }
+
     private func fallbackHeight() -> CGFloat {
         let windowRows = store.snapshots.reduce(0) { $0 + max($1.windows.count, $1.error == nil ? 0 : 1) }
-        return min(640, max(160, CGFloat(84 + store.snapshots.count * 86 + store.hidden.count * 22 + windowRows * 18)))
+        let estimated = CGFloat(84 + store.snapshots.count * 86 + store.hidden.count * 22 + windowRows * 18)
+        let screenHeight = (view.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 800
+        return min(screenHeight - 48, max(160, estimated))
     }
 
     @objc private func refresh() {
-        Task { await store.refresh() }
+        Task { await store.refresh(userInitiated: true) }
     }
 
     @objc private func quit() {
@@ -586,6 +725,7 @@ final class PanelController: NSViewController {
         editingKey = key
         namingKey = nil
         editError = nil
+        draftPicker = nil
         if let billing = store.snapshots.first(where: { $0.billingIdentity == key })?.billing {
             draftDate = BillingCalendar.next(anchor: billing.at, renews: billing.renews)
         } else {
@@ -599,8 +739,8 @@ final class PanelController: NSViewController {
     }
 
     @objc private func saveBilling(_ sender: KeyButton) {
-        let day = draftPicker?.dateValue ?? draftDate
-        if store.setManualBilling(key: sender.key, day: day) {
+        commitBillingDraft()
+        if store.setManualBilling(key: sender.key, day: draftDate) {
             editingKey = nil
             editError = nil
         } else {

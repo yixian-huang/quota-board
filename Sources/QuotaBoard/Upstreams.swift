@@ -1,4 +1,6 @@
 import Foundation
+import LocalAuthentication
+import Security
 
 struct AccountReading: Sendable {
     var snapshot: ProviderSnapshot
@@ -39,13 +41,12 @@ enum AccountDeduper {
     static func merge(_ readings: [AccountReading]) -> [ProviderSnapshot] {
         let items = readings.map { $0.normalized() }
         let hasWindows = items.contains { !$0.snapshot.windows.isEmpty }
-        let kept = items.enumerated().filter { index, reading in
+        let kept = items.filter { reading in
             if hasWindows, reading.identityKeys.isEmpty, reading.snapshot.windows.isEmpty, !reading.retain {
                 return false
             }
-            _ = index
             return true
-        }.map(\.element)
+        }
         guard !kept.isEmpty else { return [] }
 
         var parent = Array(kept.indices)
@@ -237,20 +238,19 @@ enum UpstreamConfig {
 
 enum KeychainSecret {
     static func password(service: String, account: String) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", service, "-a", account, "-w"]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = Pipe()
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        let query = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne,
+            kSecUseAuthenticationContext: context,
+        ] as CFDictionary
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query, &item)
+        guard status == errSecSuccess, let data = item as? Data else { return nil }
         let text = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let text, !text.isEmpty else { return nil }
@@ -259,7 +259,7 @@ enum KeychainSecret {
 }
 
 enum UpstreamService {
-    static func fetchCodex() async -> [AccountReading] {
+    static func fetchCodex(force: Bool = false) async -> [AccountReading] {
         let loaded = UpstreamConfig.load()
         if let message = loaded.error {
             return [failure("upstreams", message)]
@@ -267,7 +267,7 @@ enum UpstreamService {
         guard !loaded.specs.isEmpty else { return [] }
         return await withTaskGroup(of: [AccountReading].self) { group in
             for spec in loaded.specs {
-                group.addTask { await fetch(spec) }
+                group.addTask { await fetch(spec, force: force) }
             }
             var readings: [AccountReading] = []
             for await batch in group {
@@ -277,13 +277,13 @@ enum UpstreamService {
         }
     }
 
-    private static func fetch(_ spec: UpstreamSpec) async -> [AccountReading] {
+    private static func fetch(_ spec: UpstreamSpec, force: Bool) async -> [AccountReading] {
         guard let secret = KeychainSecret.password(service: spec.keychainService, account: spec.keychainAccount) else {
             return [failure(spec.name, "\(spec.name) 未配置管理凭证")]
         }
         switch spec.kind {
         case "sub2api":
-            return await Sub2APICodex.fetch(spec: spec, secret: secret)
+            return await Sub2APICodex.fetch(spec: spec, secret: secret, force: force)
         case "new-api":
             return await NewAPICodex.fetch(spec: spec, secret: secret)
         case "cpa":
@@ -344,37 +344,63 @@ enum Sub2APICodex {
     struct Page {
         var accounts: [Account]
         var total: Int
+        var rawCount: Int
     }
 
-    static func fetch(spec: UpstreamSpec, secret: String) async -> [AccountReading] {
+    static func fetch(spec: UpstreamSpec, secret: String, force: Bool = false) async -> [AccountReading] {
         var page = 1
         var accounts: [Account] = []
+        var tail: String?
+        var truncated = false
         while page <= 20 {
             guard let url = UpstreamHTTP.endpoint(
                 spec.baseURL,
                 "/api/v1/admin/accounts?platform=openai&type=oauth&page=\(page)&page_size=100"
             ) else {
-                return [upstreamFailure(spec.name, "\(spec.name) 地址无法解析")]
+                tail = "\(spec.name) 地址无法解析"
+                break
             }
             let status: Int
             let data: Data
             do {
                 (status, data) = try await HTTP.get(url, headers: authHeaders(secret))
             } catch {
-                return [upstreamFailure(spec.name, "\(spec.name) 用量读取失败")]
+                tail = "\(spec.name) 用量读取失败"
+                break
             }
             guard status == 200 else {
-                return [upstreamFailure(spec.name, UpstreamHTTP.message(status: status, name: spec.name))]
+                tail = UpstreamHTTP.message(status: status, name: spec.name)
+                break
             }
             guard let parsed = try? parsePage(data) else {
-                return [upstreamFailure(spec.name, "\(spec.name) 账号列表无法解析")]
+                tail = "\(spec.name) 账号列表无法解析"
+                break
             }
             accounts.append(contentsOf: parsed.accounts)
-            if accounts.count >= parsed.total || parsed.accounts.isEmpty { break }
-            page += 1
+            let more = parsed.rawCount == 100 && page * 100 < parsed.total
+            if more, page < 20 {
+                page += 1
+                continue
+            }
+            truncated = more && page == 20
+            break
         }
-        guard !accounts.isEmpty else { return [] }
-        return await usage(spec: spec, secret: secret, accounts: accounts)
+        if accounts.isEmpty {
+            if let tail {
+                return [upstreamFailure(spec.name, tail)]
+            }
+            if truncated {
+                return [upstreamFailure(spec.name, "\(spec.name) 还有账号未读取")]
+            }
+            return []
+        }
+        var readings = await usage(spec: spec, secret: secret, accounts: accounts, force: force)
+        if let tail {
+            readings.append(upstreamFailure(spec.name, tail))
+        } else if truncated {
+            readings.append(upstreamFailure(spec.name, "\(spec.name) 还有账号未读取"))
+        }
+        return readings
     }
 
     static func parsePage(_ data: Data) throws -> Page {
@@ -385,7 +411,11 @@ enum Sub2APICodex {
         let envelope = root["data"] as? [String: Any] ?? [:]
         let items = envelope["items"] as? [[String: Any]] ?? []
         let accounts = items.compactMap(account(from:))
-        return Page(accounts: accounts, total: JSONValue.int(envelope["total"]) ?? items.count)
+        return Page(
+            accounts: accounts,
+            total: JSONValue.int(envelope["total"]) ?? items.count,
+            rawCount: items.count
+        )
     }
 
     static func readings(accounts: [Account], usage data: Data, source: String) -> [AccountReading] {
@@ -427,16 +457,21 @@ enum Sub2APICodex {
         }
     }
 
-    private static func usage(spec: UpstreamSpec, secret: String, accounts: [Account]) async -> [AccountReading] {
+    private static func usage(
+        spec: UpstreamSpec,
+        secret: String,
+        accounts: [Account],
+        force: Bool
+    ) async -> [AccountReading] {
         guard let url = UpstreamHTTP.endpoint(spec.baseURL, "/api/v1/admin/accounts/usage/batch") else {
-            return [upstreamFailure(spec.name, "\(spec.name) 地址无法解析")]
+            return usageFailures(accounts, spec: spec, message: "\(spec.name) 地址无法解析")
         }
         let body = try? JSONSerialization.data(withJSONObject: [
             "account_ids": accounts.map(\.id),
-            "force": false,
+            "force": force,
         ])
         guard let body else {
-            return [upstreamFailure(spec.name, "\(spec.name) 用量读取失败")]
+            return usageFailures(accounts, spec: spec, message: "\(spec.name) 用量读取失败")
         }
         var headers = authHeaders(secret)
         headers["Content-Type"] = "application/json"
@@ -445,12 +480,41 @@ enum Sub2APICodex {
         do {
             (status, data) = try await HTTP.post(url, headers: headers, body: body)
         } catch {
-            return [upstreamFailure(spec.name, "\(spec.name) 用量读取失败")]
+            return usageFailures(accounts, spec: spec, message: "\(spec.name) 用量读取失败")
         }
         guard status == 200 else {
-            return [upstreamFailure(spec.name, UpstreamHTTP.message(status: status, name: spec.name))]
+            return usageFailures(
+                accounts,
+                spec: spec,
+                message: UpstreamHTTP.message(status: status, name: spec.name),
+                status: status
+            )
         }
         return readings(accounts: accounts, usage: data, source: spec.name)
+    }
+
+    private static func usageFailures(
+        _ accounts: [Account],
+        spec: UpstreamSpec,
+        message: String,
+        status: Int = -1
+    ) -> [AccountReading] {
+        guard !accounts.isEmpty else {
+            return [upstreamFailure(spec.name, message)]
+        }
+        return accounts.map { account in
+            identified(
+                account,
+                snapshot: failed(
+                    "sub2api-\(account.id)",
+                    "Codex",
+                    "Codex",
+                    plan: account.plan,
+                    .http(status, message)
+                ),
+                source: spec.name
+            )
+        }
     }
 
     private static func account(from item: [String: Any]) -> Account? {
@@ -579,6 +643,7 @@ enum NewAPICodex {
     struct Page {
         var channels: [Channel]
         var total: Int
+        var rawCount: Int
     }
 
     static func fetch(spec: UpstreamSpec, secret: String) async -> [AccountReading] {
@@ -587,45 +652,57 @@ enum NewAPICodex {
         }
         var page = 1
         var channels: [Channel] = []
-        var total = Int.max
-        while page <= 20 && channels.count < total {
+        var tail: String?
+        var truncated = false
+        while page <= 20 {
             guard let url = UpstreamHTTP.endpoint(
                 spec.baseURL,
                 "/api/channel/?p=\(page)&page_size=100&type=57"
             ) else {
-                return [upstreamFailure(spec.name, "\(spec.name) 地址无法解析")]
+                tail = "\(spec.name) 地址无法解析"
+                break
             }
             let status: Int
             let data: Data
             do {
                 (status, data) = try await HTTP.get(url, headers: authHeaders(secret, userID: userID))
             } catch {
-                return [upstreamFailure(spec.name, "\(spec.name) 用量读取失败")]
+                tail = "\(spec.name) 用量读取失败"
+                break
             }
             guard status == 200 else {
-                return [upstreamFailure(spec.name, UpstreamHTTP.message(status: status, name: spec.name))]
+                tail = UpstreamHTTP.message(status: status, name: spec.name)
+                break
             }
             guard let parsed = try? parsePage(data) else {
-                return [upstreamFailure(spec.name, "\(spec.name) 渠道列表无法解析")]
+                tail = "\(spec.name) 渠道列表无法解析"
+                break
             }
-            total = parsed.total
             channels.append(contentsOf: parsed.channels)
-            if parsed.channels.count < 100 { break }
-            page += 1
-        }
-        guard !channels.isEmpty else { return [] }
-        return await withTaskGroup(of: AccountReading.self) { group in
-            for channel in channels {
-                group.addTask {
-                    await usage(spec: spec, secret: secret, userID: userID, channel: channel)
-                }
+            let more = parsed.rawCount == 100 && page * 100 < parsed.total
+            if more, page < 20 {
+                page += 1
+                continue
             }
-            var readings: [AccountReading] = []
-            for await reading in group {
-                readings.append(reading)
-            }
-            return readings
+            truncated = more && page == 20
+            break
         }
+        if channels.isEmpty {
+            if let tail {
+                return [upstreamFailure(spec.name, tail)]
+            }
+            if truncated {
+                return [upstreamFailure(spec.name, "\(spec.name) 还有账号未读取")]
+            }
+            return []
+        }
+        var readings = await usageReadings(spec: spec, secret: secret, userID: userID, channels: channels)
+        if let tail {
+            readings.append(upstreamFailure(spec.name, tail))
+        } else if truncated {
+            readings.append(upstreamFailure(spec.name, "\(spec.name) 还有账号未读取"))
+        }
+        return readings
     }
 
     static func parsePage(_ data: Data) throws -> Page {
@@ -634,17 +711,19 @@ enum NewAPICodex {
         let envelope = root["data"] as? [String: Any] ?? [:]
         let items = envelope["items"] as? [[String: Any]] ?? []
         let channels = items.compactMap(channel(from:))
-        return Page(channels: channels, total: JSONValue.int(envelope["total"]) ?? items.count)
+        return Page(
+            channels: channels,
+            total: JSONValue.int(envelope["total"]) ?? items.count,
+            rawCount: items.count
+        )
     }
 
     static func reading(channel: Channel, body: Data, source: String) -> AccountReading {
         guard
             let root = try? JSONValue.object(from: body),
             (root["success"] as? Bool) == true,
-            let payload = root["data"],
-            !(payload is NSNull),
-            let payloadData = try? JSONSerialization.data(withJSONObject: payload),
-            let snapshot = try? CodexProvider.parse(payloadData)
+            let payload = root["data"] as? [String: Any],
+            let snapshot = try? CodexProvider.parse(object: payload)
         else {
             return AccountReading(
                 snapshot: failed("new-api-\(channel.id)", "Codex", "Codex", plan: nil, .malformed),
@@ -656,7 +735,7 @@ enum NewAPICodex {
                 source: source
             )
         }
-        let identity = CodexProvider.identity(in: payloadData)
+        let identity = CodexProvider.identity(in: payload)
         return AccountReading(
             snapshot: ProviderSnapshot(
                 id: "new-api-\(channel.id)",
@@ -675,6 +754,37 @@ enum NewAPICodex {
             label: channel.name,
             source: source
         )
+    }
+
+    private static func usageReadings(
+        spec: UpstreamSpec,
+        secret: String,
+        userID: String,
+        channels: [Channel]
+    ) async -> [AccountReading] {
+        await withTaskGroup(of: AccountReading.self) { group in
+            var index = 0
+            let width = min(6, channels.count)
+            while index < width {
+                let channel = channels[index]
+                index += 1
+                group.addTask {
+                    await usage(spec: spec, secret: secret, userID: userID, channel: channel)
+                }
+            }
+            var readings: [AccountReading] = []
+            while let reading = await group.next() {
+                readings.append(reading)
+                if index < channels.count {
+                    let channel = channels[index]
+                    index += 1
+                    group.addTask {
+                        await usage(spec: spec, secret: secret, userID: userID, channel: channel)
+                    }
+                }
+            }
+            return readings
+        }
     }
 
     private static func usage(spec: UpstreamSpec, secret: String, userID: String, channel: Channel) async -> AccountReading {
@@ -781,7 +891,7 @@ enum CPACodex {
             let name = displayLabel(JSONValue.string(file["label"]) ?? JSONValue.string(file["name"]))
             return AccountReading(
                 snapshot: ProviderSnapshot(
-                    id: "cpa-\(index)",
+                    id: snapshotID(file: file, index: index),
                     name: "Codex",
                     shortName: "Codex",
                     plan: plan,
@@ -796,9 +906,21 @@ enum CPACodex {
                 email: JSONValue.string(file["email"]),
                 freshness: 1,
                 label: name,
-                source: "cpa"
+                source: source
             )
         }
+    }
+
+    private static func snapshotID(file: [String: Any], index: Int) -> String {
+        let raw = JSONValue.string(file["id"])
+            ?? JSONValue.string(file["name"])
+            ?? JSONValue.string(file["label"])
+        guard let raw else { return "cpa-\(index)" }
+        let sanitized = raw
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+        if sanitized.hasPrefix("cpa-") { return sanitized }
+        return "cpa-\(sanitized)"
     }
 
     private static func window(

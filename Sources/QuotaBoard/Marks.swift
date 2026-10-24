@@ -10,11 +10,11 @@ enum Mark {
     }
 
     static func kind(for snapshot: ProviderSnapshot) -> Kind? {
-        let hay = "\(snapshot.id) \(snapshot.name) \(snapshot.shortName)".lowercased()
-        if hay.contains("claude") { return .claude }
-        if hay.contains("cursor") { return .cursor }
-        if hay.contains("grok") { return .grok }
-        if hay.contains("codex") || hay.contains("openai") { return .codex }
+        let id = snapshot.id.lowercased()
+        if id == "claude" || id.hasPrefix("claude-") { return .claude }
+        if id == "cursor" || id.hasPrefix("cursor-") { return .cursor }
+        if id == "grok" || id.hasPrefix("grok-") { return .grok }
+        if id == "codex" || id.hasPrefix("codex-") { return .codex }
         return nil
     }
 
@@ -48,9 +48,20 @@ enum Mark {
         }
     }
 
+    private nonisolated(unsafe) static var bundledImages: [String: NSImage] = [:]
+    private static let bundledLock = NSLock()
+
     private static func bundled(_ name: String) -> NSImage? {
+        if let cached = bundledLock.withLock({ bundledImages[name] }) {
+            return cached
+        }
         guard let url = Bundle.module.url(forResource: name, withExtension: "png") else { return nil }
-        return NSImage(contentsOf: url)
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        return bundledLock.withLock {
+            if let cached = bundledImages[name] { return cached }
+            bundledImages[name] = image
+            return image
+        }
     }
 
     private static func boardIcon(side: CGFloat) -> NSImage {

@@ -443,17 +443,36 @@ enum JSONValue {
 
     static func date(_ value: Any?) -> Date? {
         if let text = value as? String {
-            let withFraction = ISO8601DateFormatter()
-            withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = withFraction.date(from: text) { return date }
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            return plain.date(from: text)
+            return DateParsers.shared.parse(text)
         }
         guard let number = number(value) else { return nil }
         if number > 1_000_000_000_000 { return Date(timeIntervalSince1970: number / 1000) }
         if number > 1_000_000_000 { return Date(timeIntervalSince1970: number) }
         return nil
+    }
+
+    private final class DateParsers: @unchecked Sendable {
+        static let shared = DateParsers()
+
+        private let lock = NSLock()
+        private let fractional: ISO8601DateFormatter
+        private let plain: ISO8601DateFormatter
+
+        private init() {
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let plain = ISO8601DateFormatter()
+            plain.formatOptions = [.withInternetDateTime]
+            self.fractional = fractional
+            self.plain = plain
+        }
+
+        func parse(_ text: String) -> Date? {
+            lock.lock()
+            defer { lock.unlock() }
+            if let date = fractional.date(from: text) { return date }
+            return plain.date(from: text)
+        }
     }
 }
 

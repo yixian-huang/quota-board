@@ -75,8 +75,21 @@ enum SelfTest {
             """.utf8), plan: nil)
             check(grokBill.windows[0].resetsAt == JSONValue.date("2026-10-03T15:41:13Z"), "grok reset stays weekly")
             check(grokBill.billing?.at == JSONValue.date("2026-11-01T00:00:00Z"), "grok billing period")
+            let grokZero = try GrokProvider.parse(Data("""
+            {"config":{"creditUsagePercent":0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"}}}
+            """.utf8), plan: nil)
+            check(grokZero.windows.first?.usedPercent == 0, "grok zero stays zero")
         } catch {
             failures.append("parse threw \(error)")
+        }
+        do {
+            _ = try GrokProvider.parse(Data("""
+            {"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"}}}
+            """.utf8), plan: nil)
+            failures.append("grok missing percent parsed")
+        } catch is ParseError {
+        } catch {
+            failures.append("grok missing percent threw \(error)")
         }
 
         let now = Date(timeIntervalSince1970: 1_750_000_000)
@@ -138,6 +151,9 @@ enum SelfTest {
             note: nil, error: "失败", isStale: false
         )], now: now) == "额度不可用", "error menu")
 
+        let renamedCodex = sample("codex-a", "claude-work", used: 4)
+        check(Mark.kind(for: renamedCodex) == .codex, "rename keeps codex \(String(describing: Mark.kind(for: renamedCodex)))")
+        check(Mark.kind(for: sample("claude", "Codex", used: 1)) == .claude, "id wins over name")
         check(Mark.icon(.board, side: 16).size == NSSize(width: 16, height: 16), "board icon")
         for name in ["claude", "codex", "cursor", "cursor-dark", "grok"] {
             check(Bundle.module.url(forResource: name, withExtension: "png") != nil, "icon \(name)")

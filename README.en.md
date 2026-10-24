@@ -26,7 +26,7 @@ The menu bar shows the window that expires soonest and its remaining percent. Op
 - Claude: `~/.claude/.credentials.json`, and the Keychain item `Claude Code-credentials`. When the login expires, the app exchanges the existing refresh token and writes the new login back after a successful refresh.
 - Codex: `$CODEX_HOME/auth.json`, or `~/.codex/auth.json`. The local reader uses that one file.
 - Cursor: `cursorAuth/accessToken` and `cursorAuth/stripeMembershipType` in `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`.
-- Grok: `$GROK_HOME/auth.json`, or `~/.grok/auth.json`. When the login expires, the app launches `grok` once and lets it refresh itself.
+- Grok: `$GROK_HOME/auth.json`, or `~/.grok/auth.json`. When the login expires, open `grok` once and let it refresh the login.
 
 ## Gateways
 

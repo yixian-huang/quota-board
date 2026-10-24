@@ -46,6 +46,7 @@ enum HTTP {
     ) async throws -> (Int, Data) {
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = method
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         request.httpBody = body
         return try await data(for: request)
@@ -53,32 +54,76 @@ enum HTTP {
 }
 
 enum QuotaService {
-    static func fetchAll() async -> [ProviderSnapshot] {
-        async let claude = ClaudeProvider.fetch()
-        async let cursor = CursorProvider.fetch()
-        async let grok = GrokProvider.fetch()
-        async let codex = codexSnapshots()
-        let codexItems = await codex
-        return [await claude] + codexItems + [await cursor, await grok]
+    static func fetchAll(
+        force: Bool = false,
+        onUpdate: (@MainActor (ProviderSnapshot) -> Void)? = nil,
+        onCodex: (@MainActor ([ProviderSnapshot]) -> Void)? = nil
+    ) async -> [ProviderSnapshot] {
+        enum Piece: Sendable {
+            case claude(ProviderSnapshot)
+            case cursor(ProviderSnapshot)
+            case grok(ProviderSnapshot)
+            case codex([ProviderSnapshot])
+        }
+        return await withTaskGroup(of: Piece.self) { group in
+            group.addTask { .claude(await ClaudeProvider.fetch()) }
+            group.addTask { .cursor(await CursorProvider.fetch()) }
+            group.addTask { .grok(await GrokProvider.fetch()) }
+            group.addTask { .codex(await codexSnapshots(force: force)) }
+            var claude: ProviderSnapshot?
+            var cursor: ProviderSnapshot?
+            var grok: ProviderSnapshot?
+            var codexItems: [ProviderSnapshot] = []
+            for await piece in group {
+                switch piece {
+                case let .claude(snapshot):
+                    claude = snapshot
+                    if onUpdate != nil {
+                        await MainActor.run { onUpdate?(snapshot) }
+                    }
+                case let .cursor(snapshot):
+                    cursor = snapshot
+                    if onUpdate != nil {
+                        await MainActor.run { onUpdate?(snapshot) }
+                    }
+                case let .grok(snapshot):
+                    grok = snapshot
+                    if onUpdate != nil {
+                        await MainActor.run { onUpdate?(snapshot) }
+                    }
+                case let .codex(items):
+                    codexItems = items
+                    if onCodex != nil {
+                        await MainActor.run { onCodex?(items) }
+                    }
+                }
+            }
+            return [
+                claude ?? failed("claude", "Claude", "Claude", plan: nil, .http(-1, "Claude 请求失败")),
+            ] + codexItems + [
+                cursor ?? failed("cursor", "Cursor", "Cursor", plan: nil, .http(-1, "Cursor 请求失败")),
+                grok ?? failed("grok", "Grok", "Grok", plan: nil, .http(-1, "Grok 请求失败")),
+            ]
+        }
     }
 
-    private static func codexSnapshots() async -> [ProviderSnapshot] {
+    private static func codexSnapshots(force: Bool) async -> [ProviderSnapshot] {
         async let local = CodexProvider.fetchReading()
-        async let remote = UpstreamService.fetchCodex()
+        async let remote = UpstreamService.fetchCodex(force: force)
         let localReading = await local
         let remoteReadings = await remote
-        let merged = AccountDeduper.merge([localReading] + remoteReadings)
-        return merged.sorted { lhs, rhs in
-            let left = lhs.tightest?.remainingPercent ?? 101
-            let right = rhs.tightest?.remainingPercent ?? 101
-            if left != right { return left < right }
-            return lhs.name < rhs.name
-        }
+        return AccountDeduper.merge([localReading] + remoteReadings)
     }
 }
 
 enum ClaudeProvider {
     static func fetch() async -> ProviderSnapshot {
+        func checked(_ snapshot: ProviderSnapshot) -> ProviderSnapshot {
+            if snapshot.windows.isEmpty, snapshot.error == nil {
+                return failed("claude", "Claude", "Claude", plan: snapshot.plan, .malformed)
+            }
+            return snapshot
+        }
         do {
             guard var oauth = ClaudeCredentials.load() else {
                 throw ProviderFailure.notSignedIn("Claude")
@@ -86,23 +131,23 @@ enum ClaudeProvider {
             if oauth.isExpired {
                 oauth = try await ClaudeCredentials.refresh(oauth)
             }
-            let snapshot = try await usage(token: oauth.accessToken, plan: planName(oauth.subscriptionType))
-            if snapshot.windows.isEmpty, snapshot.error == nil {
-                return failed("claude", "Claude", "Claude", plan: snapshot.plan, .malformed)
-            }
-            return snapshot
+            return checked(try await usage(token: oauth.accessToken, plan: planName(oauth.subscriptionType)))
         } catch let error as ProviderFailure {
             if case .http(401, _) = error, let oauth = ClaudeCredentials.load() {
                 do {
                     let refreshed = try await ClaudeCredentials.refresh(oauth)
-                    return try await usage(token: refreshed.accessToken, plan: planName(refreshed.subscriptionType))
+                    return checked(try await usage(token: refreshed.accessToken, plan: planName(refreshed.subscriptionType)))
                 } catch let refreshError as ProviderFailure {
                     return failed("claude", "Claude", "Claude", plan: planName(oauth.subscriptionType), refreshError)
+                } catch is ParseError {
+                    return failed("claude", "Claude", "Claude", plan: nil, .malformed)
                 } catch {
                     return failed("claude", "Claude", "Claude", plan: nil, .http(-1, "Claude 请求失败"))
                 }
             }
             return failed("claude", "Claude", "Claude", plan: nil, error)
+        } catch is ParseError {
+            return failed("claude", "Claude", "Claude", plan: nil, .malformed)
         } catch {
             return failed("claude", "Claude", "Claude", plan: nil, .http(-1, "Claude 请求失败"))
         }
@@ -207,8 +252,9 @@ enum CodexProvider {
                 let message = status == 401 ? "Codex 登录已过期，在终端重新打开 codex" : "Codex 用量请求失败"
                 throw ProviderFailure.http(status, message)
             }
-            let snapshot = try parse(data).replacing(billing: billing)
-            let identity = identity(in: data)
+            let root = try JSONValue.object(from: data)
+            let snapshot = try parse(object: root).replacing(billing: billing)
+            let identity = identity(in: root)
             return AccountReading(
                 snapshot: snapshot,
                 accountID: accountID ?? identity.accountID,
@@ -221,6 +267,16 @@ enum CodexProvider {
         } catch let error as ProviderFailure {
             return AccountReading(
                 snapshot: failed("codex", "Codex", "Codex", plan: nil, error).replacing(billing: billing),
+                accountID: accountID,
+                userID: nil,
+                email: nil,
+                freshness: 3,
+                label: nil,
+                source: "local"
+            )
+        } catch is ParseError {
+            return AccountReading(
+                snapshot: failed("codex", "Codex", "Codex", plan: nil, .malformed).replacing(billing: billing),
                 accountID: accountID,
                 userID: nil,
                 email: nil,
@@ -245,7 +301,11 @@ enum CodexProvider {
         guard let root = try? JSONValue.object(from: data) else {
             return (nil, nil, nil)
         }
-        return (
+        return identity(in: root)
+    }
+
+    static func identity(in root: [String: Any]) -> (accountID: String?, userID: String?, email: String?) {
+        (
             JSONValue.string(root["account_id"]) ?? JSONValue.string(root["chatgpt_account_id"]),
             JSONValue.string(root["user_id"]),
             JSONValue.string(root["email"])
@@ -253,7 +313,10 @@ enum CodexProvider {
     }
 
     static func parse(_ data: Data) throws -> ProviderSnapshot {
-        let root = try JSONValue.object(from: data)
+        try parse(object: JSONValue.object(from: data))
+    }
+
+    static func parse(object root: [String: Any]) throws -> ProviderSnapshot {
         let plan = planName(root["plan_type"] as? String)
         let rateLimit = root["rate_limit"] as? [String: Any] ?? [:]
         var windows: [QuotaWindow] = []
@@ -313,13 +376,21 @@ enum CodexProvider {
 enum CursorProvider {
     static func fetch() async -> ProviderSnapshot {
         do {
-            guard let credentials = CursorCredentials.load() else {
+            let accessToken: String
+            let membership: String?
+            switch CursorCredentials.read() {
+            case .missing:
                 throw ProviderFailure.notSignedIn("Cursor")
+            case .unreadable:
+                throw ProviderFailure.http(-1, "Cursor 数据库正忙或无法读取")
+            case let .ready(token, membershipType):
+                accessToken = token
+                membership = membershipType
             }
             let (status, data) = try await HTTP.get(
                 URL(string: "https://api2.cursor.sh/auth/usage-summary")!,
                 headers: [
-                    "Authorization": "Bearer \(credentials.accessToken)",
+                    "Authorization": "Bearer \(accessToken)",
                     "Accept": "application/json",
                     "User-Agent": "Cursor/1.0",
                 ]
@@ -328,9 +399,11 @@ enum CursorProvider {
                 let message = status == 401 ? "Cursor 登录已过期，打开 Cursor 重新登录" : "Cursor 用量请求失败"
                 throw ProviderFailure.http(status, message)
             }
-            return try parse(data, membership: credentials.membership)
+            return try parse(data, membership: membership)
         } catch let error as ProviderFailure {
             return failed("cursor", "Cursor", "Cursor", plan: nil, error)
+        } catch is ParseError {
+            return failed("cursor", "Cursor", "Cursor", plan: nil, .malformed)
         } catch {
             return failed("cursor", "Cursor", "Cursor", plan: nil, .http(-1, "Cursor 请求失败"))
         }
@@ -390,9 +463,6 @@ enum GrokProvider {
             guard let session = GrokCredentials.load() else {
                 throw ProviderFailure.notSignedIn("Grok")
             }
-            if let expires = session.expiresAt, expires.timeIntervalSinceNow < 60 {
-                throw ProviderFailure.expired("Grok 登录即将过期或已过期。打开一次 grok，让它自己刷新登录")
-            }
             var headers = [
                 "Authorization": "Bearer \(session.accessToken)",
                 "Accept": "application/json",
@@ -402,24 +472,34 @@ enum GrokProvider {
             if let userID = session.userID, !userID.isEmpty {
                 headers["x-userid"] = userID
             }
-            let (status, data) = try await HTTP.get(
-                URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!,
-                headers: headers
-            )
+            async let planTask = planName(headers: headers)
+            let status: Int
+            let data: Data
+            do {
+                (status, data) = try await HTTP.get(
+                    URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!,
+                    headers: headers
+                )
+            } catch {
+                _ = await planTask
+                throw error
+            }
             guard status == 200 else {
+                _ = await planTask
                 if status == 401 || status == 403 {
                     throw ProviderFailure.expired("Grok 登录已失效。打开一次 grok，让它自己刷新登录")
                 }
                 throw ProviderFailure.http(status, "Grok 用量请求失败")
             }
-            let plan = await planName(headers: headers)
-            var snapshot = try parse(data, plan: plan)
+            var snapshot = try parse(data, plan: await planTask)
             if snapshot.billing == nil {
                 snapshot = await monthlyBilling(snapshot, headers: headers)
             }
             return snapshot
         } catch let error as ProviderFailure {
             return failed("grok", "Grok", "Grok", plan: nil, error)
+        } catch is ParseError {
+            return failed("grok", "Grok", "Grok", plan: nil, .malformed)
         } catch {
             return failed("grok", "Grok", "Grok", plan: nil, .http(-1, "Grok 请求失败"))
         }
@@ -428,7 +508,7 @@ enum GrokProvider {
     static func parse(_ data: Data, plan: String?) throws -> ProviderSnapshot {
         let root = try JSONValue.object(from: data)
         guard let config = root["config"] as? [String: Any] else { throw ParseError.malformed }
-        let used = JSONValue.number(config["creditUsagePercent"]) ?? 0
+        guard let used = JSONValue.number(config["creditUsagePercent"]) else { throw ParseError.malformed }
         let period = config["currentPeriod"] as? [String: Any]
         let periodType = (period?["type"] as? String) ?? ""
         let label = periodType.contains("WEEK") ? "每周" : (periodType.contains("MONTH") ? "每月" : "额度")

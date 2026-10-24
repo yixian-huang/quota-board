@@ -1,4 +1,7 @@
 import Foundation
+import LocalAuthentication
+import os
+import Security
 import SQLite3
 
 enum CredentialPaths {
@@ -50,20 +53,21 @@ struct ClaudeOAuth: Sendable {
 enum ClaudeCredentials {
     private static let service = "Claude Code-credentials"
     private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    // Rotated refresh token survives a failed keychain write for the next load() in this process.
+    private static let latest = OSAllocatedUnfairLock<ClaudeOAuth?>(initialState: nil)
+
+    private enum KeychainItem {
+        case found(data: Data, account: String?)
+        case missing
+        case failed
+    }
 
     static func load() -> ClaudeOAuth? {
-        let fromFile = loadFile()
-        let fromKeychain = loadKeychain()
-        switch (fromFile, fromKeychain) {
-        case let (file?, keychain?):
-            return keychain.expiresAt >= file.expiresAt ? keychain : file
-        case let (file?, nil):
-            return file
-        case let (nil, keychain?):
-            return keychain
-        case (nil, nil):
-            return nil
-        }
+        let stored = newer(loadFile(), loadKeychain())
+        let memory = latest.withLock { $0 }
+        guard let memory else { return stored }
+        guard let stored else { return memory }
+        return memory.expiresAt > stored.expiresAt ? memory : stored
     }
 
     static func refresh(_ oauth: ClaudeOAuth) async throws -> ClaudeOAuth {
@@ -96,7 +100,7 @@ enum ClaudeCredentials {
             subscriptionType: oauth.subscriptionType,
             source: oauth.source
         )
-        try persist(updated)
+        persist(updated)
         return updated
     }
 
@@ -118,7 +122,7 @@ enum ClaudeCredentials {
     }
 
     private static func loadKeychain() -> ClaudeOAuth? {
-        guard let text = securityPassword(service: service), let data = text.data(using: .utf8) else { return nil }
+        guard case let .found(data, _) = readKeychainItem() else { return nil }
         return parse(data, source: .keychain)
     }
 
@@ -140,12 +144,75 @@ enum ClaudeCredentials {
         )
     }
 
-    private static func persist(_ oauth: ClaudeOAuth) throws {
-        let url = CredentialPaths.claudeCredentials()
-        var root: [String: Any] = [:]
-        if let existing = try? Data(contentsOf: url), let object = try? JSONValue.object(from: existing) {
-            root = object
+    private static func newer(_ file: ClaudeOAuth?, _ keychain: ClaudeOAuth?) -> ClaudeOAuth? {
+        switch (file, keychain) {
+        case let (file?, keychain?):
+            return keychain.expiresAt >= file.expiresAt ? keychain : file
+        case let (file?, nil):
+            return file
+        case let (nil, keychain?):
+            return keychain
+        case (nil, nil):
+            return nil
         }
+    }
+
+    private static func persist(_ oauth: ClaudeOAuth) {
+        latest.withLock { $0 = oauth }
+        attempt { writeFile(oauth) }
+        attempt { writeKeychain(oauth) }
+    }
+
+    private static func attempt(_ write: () -> Bool) {
+        if write() { return }
+        _ = write()
+    }
+
+    private static func writeFile(_ oauth: ClaudeOAuth) -> Bool {
+        let url = CredentialPaths.claudeCredentials()
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        // A keychain-only secret must not create a credentials file.
+        guard exists || oauth.source == .file else { return true }
+        let existing: [String: Any]?
+        if exists {
+            guard
+                let data = try? Data(contentsOf: url),
+                let object = try? JSONValue.object(from: data)
+            else { return false }
+            existing = object
+        } else {
+            existing = nil
+        }
+        guard let data = jsonData(merging(oauth, into: existing)) else { return false }
+        let directory = url.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func writeKeychain(_ oauth: ClaudeOAuth) -> Bool {
+        switch readKeychainItem() {
+        case let .found(data, account):
+            guard let account else { return false }
+            guard let object = try? JSONValue.object(from: data) else { return false }
+            guard let encoded = jsonData(merging(oauth, into: object)) else { return false }
+            return updateKeychain(account: account, data: encoded)
+        case .missing:
+            guard oauth.source == .keychain else { return true }
+            guard let encoded = jsonData(merging(oauth, into: nil)) else { return false }
+            return addKeychain(account: NSUserName(), data: encoded)
+        case .failed:
+            return false
+        }
+    }
+
+    private static func merging(_ oauth: ClaudeOAuth, into existing: [String: Any]?) -> [String: Any] {
+        var root = existing ?? [:]
         var inner = root["claudeAiOauth"] as? [String: Any] ?? [:]
         inner["accessToken"] = oauth.accessToken
         inner["refreshToken"] = oauth.refreshToken
@@ -154,52 +221,62 @@ enum ClaudeCredentials {
             inner["subscriptionType"] = subscription
         }
         root["claudeAiOauth"] = inner
-        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-
-        if oauth.source == .keychain || loadKeychain() != nil {
-            let text = String(data: data, encoding: .utf8) ?? ""
-            try securityUpdate(service: service, account: NSUserName(), password: text)
-        }
+        return root
     }
 
-    private static func securityPassword(service: String) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", service, "-w"]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = Pipe()
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return text?.isEmpty == false ? text : nil
+    private static func jsonData(_ root: [String: Any]) -> Data? {
+        try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 
-    private static func securityUpdate(service: String, account: String, password: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = [
-            "add-generic-password", "-U",
-            "-s", service,
-            "-a", account,
-            "-w", password,
+    private static func silentKeychainContext() -> LAContext {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return context
+    }
+
+    private static func readKeychainItem() -> KeychainItem {
+        // No account: Claude's item is not always NSUserName(). A locked context never prompts.
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: silentKeychainContext(),
         ]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        if process.terminationStatus != 0 {
-            throw ProviderFailure.http(-1, "Claude 凭证已刷新，但钥匙串没有写回")
-        }
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return .missing }
+        guard status == errSecSuccess, let item = result as? NSDictionary else { return .failed }
+        guard let data = item[kSecValueData as String] as? Data else { return .failed }
+        let account = (item[kSecAttrAccount as String] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return .found(data: data, account: account)
+    }
+
+    private static func updateKeychain(account: String, data: Data) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseAuthenticationContext as String: silentKeychainContext(),
+        ]
+        // Password bytes only; the item's ACL stays as it is.
+        let changes: [String: Any] = [
+            kSecValueData as String: data,
+        ]
+        return SecItemUpdate(query as CFDictionary, changes as CFDictionary) == errSecSuccess
+    }
+
+    private static func addKeychain(account: String, data: Data) -> Bool {
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            kSecUseAuthenticationContext as String: silentKeychainContext(),
+        ]
+        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
     }
 }
 
@@ -239,11 +316,66 @@ enum GrokCredentials {
             let data = try? Data(contentsOf: CredentialPaths.grokAuth()),
             let root = try? JSONValue.object(from: data)
         else { return nil }
-        let entries = root.compactMap { $0.value as? [String: Any] }
-        let preferred = entries.first { entry in
-            (entry["auth_mode"] as? String) == "oidc" && (entry["key"] as? String)?.isEmpty == false
-        } ?? entries.first { ($0["key"] as? String)?.isEmpty == false }
-        guard let entry = preferred, let key = entry["key"] as? String else { return nil }
+        if let entry = activeEntry(in: root), let session = session(from: entry) {
+            return session
+        }
+        let entries = accountEntries(in: root)
+        let oidc = entries.filter { isOIDC($0) }
+        let pool = oidc.isEmpty ? entries.filter(hasKey) : oidc
+        guard let entry = pool.sorted(by: preferredOrder).first else { return nil }
+        return session(from: entry)
+    }
+
+    private static func activeEntry(in root: [String: Any]) -> [String: Any]? {
+        for name in ["active", "active_account"] {
+            guard
+                let identifier = root[name] as? String,
+                let entry = root[identifier] as? [String: Any],
+                hasKey(entry)
+            else { continue }
+            return entry
+        }
+        return nil
+    }
+
+    private static func accountEntries(in root: [String: Any]) -> [[String: Any]] {
+        root.compactMap { key, value in
+            guard var entry = value as? [String: Any] else { return nil }
+            if JSONValue.string(entry["profile"]) == nil {
+                entry["profile"] = key
+            }
+            return entry
+        }
+    }
+
+    private static func isOIDC(_ entry: [String: Any]) -> Bool {
+        hasKey(entry) && (entry["auth_mode"] as? String) == "oidc"
+    }
+
+    private static func hasKey(_ entry: [String: Any]) -> Bool {
+        (entry["key"] as? String)?.isEmpty == false
+    }
+
+    private static func profile(_ entry: [String: Any]) -> String {
+        (entry["profile"] as? String) ?? ""
+    }
+
+    private static func preferredOrder(_ lhs: [String: Any], _ rhs: [String: Any]) -> Bool {
+        let leftProfile = profile(lhs)
+        let rightProfile = profile(rhs)
+        if leftProfile != rightProfile { return leftProfile < rightProfile }
+        switch (JSONValue.date(lhs["expires_at"]), JSONValue.date(rhs["expires_at"])) {
+        case let (left?, right?):
+            return left > right
+        case (.some, .none):
+            return true
+        case (.none, .some), (.none, .none):
+            return false
+        }
+    }
+
+    private static func session(from entry: [String: Any]) -> Session? {
+        guard let key = entry["key"] as? String, !key.isEmpty else { return nil }
         return Session(
             accessToken: key,
             userID: entry["user_id"] as? String,
@@ -252,36 +384,114 @@ enum GrokCredentials {
     }
 }
 
+enum CursorRead: Sendable {
+    case ready(accessToken: String, membership: String?)
+    case missing
+    case unreadable
+}
+
 enum CursorCredentials {
     static func load() -> (accessToken: String, membership: String?)? {
-        let path = CredentialPaths.cursorState().path
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
-            return nil
-        }
-        defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 3_000)
-        let token = query(db, key: "cursorAuth/accessToken")?.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        guard let token, !token.isEmpty else { return nil }
-        let membership = query(db, key: "cursorAuth/stripeMembershipType")?
-            .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        return (token, membership)
+        if case let .ready(accessToken, membership) = read() { return (accessToken, membership) }
+        return nil
     }
 
-    private static func query(_ db: OpaquePointer, key: String) -> String? {
+    static func read() -> CursorRead {
+        let source = CredentialPaths.cursorState()
+        guard FileManager.default.fileExists(atPath: source.path) else { return .missing }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quota-board-cursor-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            return .unreadable
+        }
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            try copyDatabase(source, to: directory)
+        } catch {
+            return .unreadable
+        }
+
+        let database = directory.appendingPathComponent(source.lastPathComponent)
+        var handle: OpaquePointer?
+        // Open the copy. A readonly open of the live file still creates -shm beside it.
+        let status = sqlite3_open_v2(database.path, &handle, SQLITE_OPEN_READONLY, nil)
+        defer {
+            if let handle { sqlite3_close(handle) }
+        }
+        guard status == SQLITE_OK, let db = handle else { return .unreadable }
+        sqlite3_busy_timeout(db, 3_000)
+
+        let token: String
+        switch query(db, key: "cursorAuth/accessToken") {
+        case .failed:
+            return .unreadable
+        case .none:
+            return .missing
+        case let .value(raw):
+            let trimmed = unquoted(raw)
+            guard !trimmed.isEmpty else { return .missing }
+            token = trimmed
+        }
+
+        let membership: String?
+        switch query(db, key: "cursorAuth/stripeMembershipType") {
+        case .failed:
+            return .unreadable
+        case .none:
+            membership = nil
+        case let .value(raw):
+            membership = unquoted(raw)
+        }
+        return .ready(accessToken: token, membership: membership)
+    }
+
+    private static func copyDatabase(_ source: URL, to directory: URL) throws {
+        let name = source.lastPathComponent
+        try FileManager.default.copyItem(at: source, to: directory.appendingPathComponent(name))
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = URL(fileURLWithPath: source.path + suffix)
+            guard FileManager.default.fileExists(atPath: sidecar.path) else { continue }
+            try FileManager.default.copyItem(
+                at: sidecar,
+                to: directory.appendingPathComponent(name + suffix)
+            )
+        }
+    }
+
+    private enum Row {
+        case value(String)
+        case none
+        case failed
+    }
+
+    private static func query(_ db: OpaquePointer, key: String) -> Row {
         var statement: OpaquePointer?
         let sql = "SELECT value FROM ItemTable WHERE key = ? LIMIT 1"
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            return nil
+        let prepared = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+        guard prepared == SQLITE_OK, let query = statement else {
+            if let statement { sqlite3_finalize(statement) }
+            return .failed
         }
-        defer { sqlite3_finalize(statement) }
+        defer { sqlite3_finalize(query) }
         let code: Int32 = key.withCString { pointer in
-            sqlite3_bind_text(statement, 1, pointer, -1, nil)
-            return sqlite3_step(statement)
+            let bound = sqlite3_bind_text(query, 1, pointer, -1, nil)
+            guard bound == SQLITE_OK else { return bound }
+            return sqlite3_step(query)
         }
-        guard code == SQLITE_ROW else { return nil }
-        guard let cString = sqlite3_column_text(statement, 0) else { return nil }
-        return String(cString: cString)
+        switch code {
+        case SQLITE_ROW:
+            guard let text = sqlite3_column_text(query, 0) else { return .none }
+            return .value(String(cString: text))
+        case SQLITE_DONE:
+            return .none
+        default:
+            return .failed
+        }
+    }
+
+    private static func unquoted(_ value: String) -> String {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     }
 }
