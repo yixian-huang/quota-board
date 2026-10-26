@@ -1,7 +1,5 @@
 import Foundation
-import LocalAuthentication
 import os
-import Security
 import SQLite3
 
 enum CredentialPaths {
@@ -55,12 +53,6 @@ enum ClaudeCredentials {
     private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     // Rotated refresh token survives a failed keychain write for the next load() in this process.
     private static let latest = OSAllocatedUnfairLock<ClaudeOAuth?>(initialState: nil)
-
-    private enum KeychainItem {
-        case found(data: Data, account: String?)
-        case missing
-        case failed
-    }
 
     static func load() -> ClaudeOAuth? {
         let stored = newer(loadFile(), loadKeychain())
@@ -122,7 +114,10 @@ enum ClaudeCredentials {
     }
 
     private static func loadKeychain() -> ClaudeOAuth? {
-        guard case let .found(data, _) = readKeychainItem() else { return nil }
+        // /usr/bin/security sits in the item's apple-tool partition, so this read does not prompt.
+        guard let text = KeychainSecret.password(service: service), let data = text.data(using: .utf8) else {
+            return nil
+        }
         return parse(data, source: .keychain)
     }
 
@@ -160,6 +155,7 @@ enum ClaudeCredentials {
     private static func persist(_ oauth: ClaudeOAuth) {
         latest.withLock { $0 = oauth }
         attempt { writeFile(oauth) }
+        // Keychain write is best-effort. Never use SecItem: that prompts on this ad-hoc binary.
         attempt { writeKeychain(oauth) }
     }
 
@@ -196,19 +192,21 @@ enum ClaudeCredentials {
     }
 
     private static func writeKeychain(_ oauth: ClaudeOAuth) -> Bool {
-        switch readKeychainItem() {
-        case let .found(data, account):
-            guard let account else { return false }
-            guard let object = try? JSONValue.object(from: data) else { return false }
-            guard let encoded = jsonData(merging(oauth, into: object)) else { return false }
-            return updateKeychain(account: account, data: encoded)
-        case .missing:
-            guard oauth.source == .keychain else { return true }
-            guard let encoded = jsonData(merging(oauth, into: nil)) else { return false }
-            return addKeychain(account: NSUserName(), data: encoded)
-        case .failed:
-            return false
+        let existing: [String: Any]?
+        if let text = KeychainSecret.password(service: service),
+           let data = text.data(using: .utf8),
+           let object = try? JSONValue.object(from: data) {
+            existing = object
+        } else if oauth.source == .keychain {
+            existing = nil
+        } else {
+            return true
         }
+        guard
+            let encoded = jsonData(merging(oauth, into: existing)),
+            let password = String(data: encoded, encoding: .utf8)
+        else { return false }
+        return KeychainSecret.update(service: service, account: NSUserName(), password: password)
     }
 
     private static func merging(_ oauth: ClaudeOAuth, into existing: [String: Any]?) -> [String: Any] {
@@ -226,57 +224,6 @@ enum ClaudeCredentials {
 
     private static func jsonData(_ root: [String: Any]) -> Data? {
         try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-    }
-
-    private static func silentKeychainContext() -> LAContext {
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return context
-    }
-
-    private static func readKeychainItem() -> KeychainItem {
-        // No account: Claude's item is not always NSUserName(). A locked context never prompts.
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationContext as String: silentKeychainContext(),
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return .missing }
-        guard status == errSecSuccess, let item = result as? NSDictionary else { return .failed }
-        guard let data = item[kSecValueData as String] as? Data else { return .failed }
-        let account = (item[kSecAttrAccount as String] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        return .found(data: data, account: account)
-    }
-
-    private static func updateKeychain(account: String, data: Data) -> Bool {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecUseAuthenticationContext as String: silentKeychainContext(),
-        ]
-        // Password bytes only; the item's ACL stays as it is.
-        let changes: [String: Any] = [
-            kSecValueData as String: data,
-        ]
-        return SecItemUpdate(query as CFDictionary, changes as CFDictionary) == errSecSuccess
-    }
-
-    private static func addKeychain(account: String, data: Data) -> Bool {
-        let attributes: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-            kSecUseAuthenticationContext as String: silentKeychainContext(),
-        ]
-        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
     }
 }
 

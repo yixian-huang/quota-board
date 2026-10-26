@@ -1,6 +1,4 @@
 import Foundation
-import LocalAuthentication
-import Security
 
 struct AccountReading: Sendable {
     var snapshot: ProviderSnapshot
@@ -237,24 +235,44 @@ enum UpstreamConfig {
 }
 
 enum KeychainSecret {
-    static func password(service: String, account: String) -> String? {
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        let query = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecAttrAccount: account,
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitOne,
-            kSecUseAuthenticationContext: context,
-        ] as CFDictionary
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query, &item)
-        guard status == errSecSuccess, let data = item as? Data else { return nil }
-        let text = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let text, !text.isEmpty else { return nil }
+    /// Read via Apple's signed `security` tool so partition-list ACL does not prompt Quota Board.
+    static func password(service: String, account: String? = nil) -> String? {
+        var arguments = ["find-generic-password", "-s", service]
+        if let account {
+            arguments.append(contentsOf: ["-a", account])
+        }
+        arguments.append("-w")
+        guard
+            let text = run(arguments)?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !text.isEmpty
+        else { return nil }
         return text
+    }
+
+    static func update(service: String, account: String, password: String) -> Bool {
+        run([
+            "add-generic-password", "-U",
+            "-s", service,
+            "-a", account,
+            "-w", password,
+        ]) != nil
+    }
+
+    private static func run(_ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = arguments
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
     }
 }
 
