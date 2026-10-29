@@ -216,13 +216,22 @@ enum ClaudeProvider {
     }
 
     private static func planName(_ raw: String?) -> String? {
-        switch raw?.lowercased() {
+        guard let raw else { return nil }
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        switch key {
         case "pro": return "Pro"
+        case "max_5x", "max5x": return "Max 5x"
+        case "max_20x", "max20x": return "Max 20x"
         case "max": return "Max"
         case "team": return "Team"
         case "enterprise": return "Enterprise"
-        case nil, "": return nil
-        default: return raw?.capitalized
+        case "": return nil
+        default:
+            if key.contains("max"), key.contains("20x") { return "Max 20x" }
+            if key.contains("max"), key.contains("5x") { return "Max 5x" }
+            return raw.capitalized
         }
     }
 }
@@ -448,8 +457,11 @@ enum CursorProvider {
         switch raw?.lowercased() {
         case "pro": return "Pro"
         case "pro_plus", "proplus": return "Pro+"
+        case "plus": return "Plus"
+        case "premium": return "Premium"
+        case "super": return "Super"
         case "ultra": return "Ultra"
-        case "free": return "Free"
+        case "free", "hobby": return "Free"
         case "business", "enterprise": return raw?.capitalized
         case nil, "": return nil
         default: return raw?.capitalized

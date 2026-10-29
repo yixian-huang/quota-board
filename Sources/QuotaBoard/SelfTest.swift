@@ -461,6 +461,10 @@ enum SelfTest {
         let yearFace = Format.billingFace(nextYear, now: october, calendar: calendar)
         check(yearFace.text == "2027年1月16日" && yearFace.emphasized == false, "year billing face \(yearFace)")
 
+        for failure in boardChecks() {
+            failures.append(failure)
+        }
+
         if failures.isEmpty {
             print("self-test ok")
             return 0
@@ -512,6 +516,213 @@ enum SelfTest {
             freshness: 3,
             label: nil,
             source: "local"
+        )
+    }
+
+    private static func boardChecks() -> [String] {
+        var failures: [String] = []
+        func check(_ condition: Bool, _ message: String) {
+            if !condition { failures.append(message) }
+        }
+        guard let now = JSONValue.date("2026-10-29T00:00:00Z") else {
+            return ["board clock"]
+        }
+
+        check(MeterMath.litCount(100) == 20, "full remaining lights every segment")
+        check(MeterMath.litCount(0) == 0, "empty remaining stays dark")
+        check(MeterMath.litCount(0.1) == 1, "a sliver still lights one segment")
+        check(MeterMath.litCount(67) == 14, "67% remaining rounds up to 14")
+        check(MeterMath.litCount(95) == 19, "95% remaining is 19 segments")
+        check(MeterMath.litCount(-4) == 0 && MeterMath.litCount(140) == 20, "lit count clamps")
+
+        check(BoardFormat.briefReset(now.addingTimeInterval(21 * 86_400), now: now) == "21天", "brief days")
+        check(BoardFormat.briefReset(now.addingTimeInterval(3 * 86_400 + 5 * 3_600), now: now) == "3天5时", "brief day hour")
+        check(BoardFormat.briefReset(now.addingTimeInterval(3 * 3_600 + 20 * 60), now: now) == "3时20分", "brief hour minute")
+        check(BoardFormat.briefReset(now.addingTimeInterval(48 * 60), now: now) == "48分", "brief minutes")
+        check(BoardFormat.briefReset(now.addingTimeInterval(10 * 86_400), now: now) == "10天", "brief ten days")
+        check(BoardFormat.briefReset(now.addingTimeInterval(9 * 86_400), now: now) == "9天0时", "brief nine days")
+        check(BoardFormat.briefReset(now.addingTimeInterval(-60), now: now) == "已重置", "brief past")
+        check(BoardFormat.money(13.4, currency: "USD") == "$13", "usd dollars")
+        check(BoardFormat.money(1_340, currency: "CNY") == "¥1,340", "cny grouping")
+
+        let priced = boardCard("claude", plan: "Pro", used: 33)
+        let worth = WorthMath.worth(priced, price: MonthlyPrice(amount: 20, currency: "USD"))
+        check(worth?.left == 13.4 && worth?.total == 20 && worth?.currency == "USD", "worth \(String(describing: worth))")
+        check(WorthMath.worth(priced, price: nil) == nil, "missing price has no worth")
+        let empty = ProviderSnapshot(
+            id: "codex", name: "Codex", shortName: "Codex", plan: "Pro",
+            windows: [], note: nil, error: "未登录", isStale: false
+        )
+        check(WorthMath.worth(empty, price: MonthlyPrice(amount: 20, currency: "USD")) == nil, "failed card has no worth")
+
+        let other = boardCard("cursor", plan: "Ultra", used: 50)
+        let foreign = boardCard("grok", plan: "Super", used: 0)
+        let bus = WorthMath.bus([priced, other, foreign, empty]) { snapshot in
+            switch snapshot.id {
+            case "claude": MonthlyPrice(amount: 20, currency: "USD")
+            case "cursor": MonthlyPrice(amount: 200, currency: "USD")
+            case "grok": MonthlyPrice(amount: 30, currency: "CNY")
+            default: nil
+            }
+        }
+        check(bus?.left == 113.4 && bus?.total == 220 && bus?.excluded == 2 && bus?.currency == "USD", "bus \(String(describing: bus))")
+        check(bus?.usedPercent == 100 - (113.4 / 220) * 100, "bus tone follows used share")
+
+        let shared = now.addingTimeInterval(3_600)
+        let later = now.addingTimeInterval(7_200)
+        let spans = ResetLayout.spans([
+            QuotaWindow(id: "a", label: "5 小时", usedPercent: 10, resetsAt: shared),
+            QuotaWindow(id: "b", label: "每周", usedPercent: 20, resetsAt: shared),
+            QuotaWindow(id: "c", label: "额外", usedPercent: 30, resetsAt: later),
+            QuotaWindow(id: "d", label: "无", usedPercent: 40, resetsAt: nil),
+        ]) { _ in "soon" }
+        check(spans.map(\.rows) == [2, 1, 1] && spans.map(\.text) == ["soon", "soon", ""], "reset spans \(spans)")
+
+        check(TimelineMath.position(minutes: 0) == 0, "timeline starts at now")
+        check(TimelineMath.position(minutes: TimelineMath.horizonMinutes) == 100, "timeline ends at 30 days")
+        check(TimelineMath.position(minutes: -5) == 0 && TimelineMath.position(minutes: TimelineMath.horizonMinutes + 10) == 100, "timeline clamps")
+        let hour = log1p(1) / log1p(TimelineMath.horizonMinutes / 60) * 100
+        check(abs(TimelineMath.position(minutes: 60) - hour) < 0.000_001, "timeline log hour")
+        let dots = TimelineMath.dots([
+            QuotaWindow(id: "ok", label: "每周", usedPercent: 10, resetsAt: shared),
+            QuotaWindow(id: "hot", label: "5 小时", usedPercent: 95, resetsAt: shared),
+            QuotaWindow(id: "past", label: "旧", usedPercent: 99, resetsAt: now.addingTimeInterval(-60)),
+        ], now: now)
+        check(dots.count == 1 && dots[0].tone == .hot, "merged reset keeps the hotter tone")
+        check(TimelineMath.hasFutureReset([priced], now: now) == false, "no reset hides the timeline")
+        check(TimelineMath.hasFutureReset([boardCard("claude", plan: nil, used: 1, resetsAt: later)], now: now), "future reset shows the timeline")
+
+        check(PlanSlug.make("Pro 200") == "pro-200", "plan slug spaces")
+        check(PlanSlug.make("Pro+") == "pro-plus", "plan slug plus")
+        check(PlanSlug.make("  Ultra  ") == "ultra", "plan slug trim")
+        check(PlanSlug.make(nil) == nil && PlanSlug.make("   ") == nil, "blank plan slug")
+
+        let fees = FeeTable.parse(Data("""
+        {"plans":{"pro":20,"pro-200":{"amount":200,"currency":"USD"},"bad":-1},"accounts":{"codex-work":{"amount":15,"currency":"CNY"}}}
+        """.utf8))
+        let codex = ProviderSnapshot(
+            id: "codex-local", name: "Codex", shortName: "Codex", plan: "Pro 200",
+            windows: [QuotaWindow(id: "week", label: "每周", usedPercent: 4, resetsAt: nil)],
+            note: nil, error: nil, isStale: false, billingKey: "codex-work"
+        )
+        check(fees.price(for: codex)?.amount == 15 && fees.price(for: codex)?.currency == "CNY", "account fee overrides the plan")
+        check(fees.price(for: boardCard("claude", plan: "Pro", used: 1))?.amount == 20, "plan fee")
+        check(fees.plans["bad"] == nil, "negative fee is dropped")
+        check(FeeTable.parse(Data("[]".utf8)).plans.isEmpty, "bad fee file is empty")
+        let catalog = FeeTable()
+        check(catalog.price(for: boardCard("claude", plan: "Pro", used: 1))?.amount == 20, "claude pro list price")
+        check(catalog.price(for: boardCard("claude", plan: "Max 5x", used: 1))?.amount == 100, "claude max 5x")
+        check(catalog.price(for: boardCard("claude", plan: "Max 20x", used: 1))?.amount == 200, "claude max 20x")
+        check(catalog.price(for: boardCard("claude", plan: "Max", used: 1)) == nil, "plain max has two prices")
+        check(catalog.price(for: boardCard("codex", plan: "Plus", used: 1))?.amount == 20, "codex plus")
+        check(catalog.price(for: boardCard("codex", plan: "Pro 100", used: 1))?.amount == 100, "codex pro 100")
+        check(catalog.price(for: boardCard("codex", plan: "Pro 200", used: 1))?.amount == 200, "codex pro 200")
+        check(catalog.price(for: boardCard("codex", plan: "Pro 500", used: 1))?.amount == 500, "codex pro 500")
+        check(catalog.price(for: boardCard("codex", plan: "Go", used: 1))?.amount == 8, "codex go")
+        check(catalog.price(for: boardCard("cursor", plan: "Plus", used: 1))?.amount == 8, "cursor plus")
+        check(catalog.price(for: boardCard("cursor", plan: "Pro", used: 1))?.amount == 20, "cursor legacy pro")
+        check(catalog.price(for: boardCard("cursor", plan: "Pro+", used: 1))?.amount == 60, "cursor legacy pro plus")
+        check(catalog.price(for: boardCard("cursor", plan: "Ultra", used: 1))?.amount == 200, "cursor ultra")
+        check(catalog.price(for: boardCard("grok", plan: "Premium", used: 1))?.amount == 30, "grok premium")
+        check(catalog.price(for: boardCard("grok", plan: "SuperGrok", used: 1))?.amount == 30, "supergrok")
+        let plusOverride = FeeTable.parse(Data(#"{"plans":{"plus":1}}"#.utf8))
+        check(plusOverride.price(for: boardCard("cursor", plan: "Plus", used: 1))?.amount == 1, "file overrides the list price")
+
+        let config = ResetFeedConfig(baseURL: URL(string: "https://feed.example/root/"))
+        let endpoint = config.endpoint(providers: "claude,codex")
+        check(endpoint?.path == "/root/v1/resets", "feed path \(endpoint?.path ?? "nil")")
+        check(endpoint?.query?.contains("providers=") == true, "feed query")
+        check(ResetFeedConfig(baseURL: nil).endpoint(providers: "claude") == nil, "unconfigured feed")
+
+        let parsed: FeedDocument
+        do {
+            parsed = try ResetFeedParser.parse(Data("""
+            {
+              "schema": "quota-board.reset-feed/v1",
+              "items": [
+                {
+                  "id": "five",
+                  "provider": "claude",
+                  "status": "announced",
+                  "scheduledAt": "2026-11-02T00:00:00Z",
+                  "scope": {"plans": null, "windows": ["5h"]},
+                  "summary": "5 小时窗口重置",
+                  "source": {"platform": "x", "author": {"name": "Ada", "handle": "ada"}, "url": "https://x.com/ada/status/1", "postedAt": "2026-10-28T00:00:00Z"}
+                },
+                {
+                  "id": "old",
+                  "provider": "codex",
+                  "status": "confirmed",
+                  "scheduledAt": "2026-11-03T00:00:00Z",
+                  "summary": "旧预告",
+                  "source": {"platform": "x", "author": {"name": "Bea"}, "url": "https://x.com/bea/status/1", "postedAt": "2026-10-20T00:00:00Z"}
+                },
+                {
+                  "id": "fresh",
+                  "provider": "codex",
+                  "status": "confirmed",
+                  "scheduledAt": "2026-11-04T00:00:00Z",
+                  "scope": {"plans": ["pro-200"]},
+                  "summary": "新预告",
+                  "supersedes": "old",
+                  "source": {"platform": "x", "author": {"name": "Bea"}, "url": "https://x.com/bea/status/2", "postedAt": "2026-10-27T00:00:00Z"}
+                },
+                {
+                  "id": "done",
+                  "provider": "cursor",
+                  "status": "done",
+                  "effectiveAt": "2026-10-20T00:00:00Z",
+                  "summary": "已经重置",
+                  "source": {"platform": "x", "author": {"name": "Cy"}, "url": "https://x.com/cy/status/1", "postedAt": "2026-10-20T00:00:00Z"}
+                },
+                {
+                  "id": "ancient",
+                  "provider": "grok",
+                  "status": "done",
+                  "effectiveAt": "2026-09-01T00:00:00Z",
+                  "summary": "太旧",
+                  "source": {"platform": "x", "author": {"name": "Dee"}, "url": "https://x.com/dee/status/1", "postedAt": "2026-09-01T00:00:00Z"}
+                },
+                {
+                  "id": "plain",
+                  "provider": "nope",
+                  "status": "announced",
+                  "summary": "未知来源",
+                  "source": {"platform": "x", "author": {"name": "Eve"}, "url": "http://example.com/a", "postedAt": "2026-10-28T00:00:00Z"}
+                }
+              ]
+            }
+            """.utf8))
+        } catch {
+            return failures + ["feed parse \(error)"]
+        }
+        check(parsed.items.map(\.id) == ["five", "old", "fresh", "done", "ancient"], "feed kept \(parsed.items.map(\.id))")
+        check(parsed.items[0].plans == nil && parsed.items[2].plans == ["pro-200"], "null plans match every account")
+        check((try? ResetFeedParser.parse(Data(#"{"schema":"nope","items":[]}"#.utf8))) == nil, "unknown feed schema")
+
+        let split = FeedLogic.split(parsed.items, now: now)
+        check(split.upcoming.map(\.id) == ["five", "fresh"], "upcoming \(split.upcoming.map(\.id))")
+        check(split.past.map(\.id) == ["done"], "past \(split.past.map(\.id))")
+        let claude = boardCard("claude", plan: nil, used: 10)
+        let pro = boardCard("codex", plan: "Pro 200", used: 10)
+        let bare = boardCard("codex-other", plan: nil, used: 10)
+        check(FeedLogic.affected(parsed.items[0], snapshots: [claude, pro]).map(\.id) == ["claude"], "open notice hits claude")
+        check(FeedLogic.affected(parsed.items[2], snapshots: [pro, bare]).map(\.id) == ["codex"], "plan notice skips an account without a plan")
+        check(FeedLogic.upcomingCount(parsed.items, snapshots: [claude, pro], now: now) == 2, "badge counts notices that hit a visible account")
+        check(FeedLogic.upcomingCount(parsed.items, snapshots: [bare], now: now) == 0, "hidden or unmatched accounts do not badge")
+        return failures
+    }
+
+    private static func boardCard(_ id: String, plan: String?, used: Double, resetsAt: Date? = nil) -> ProviderSnapshot {
+        ProviderSnapshot(
+            id: id,
+            name: id,
+            shortName: id,
+            plan: plan,
+            windows: [QuotaWindow(id: "\(id)-main", label: "每周", usedPercent: used, resetsAt: resetsAt)],
+            note: nil,
+            error: nil,
+            isStale: false
         )
     }
 

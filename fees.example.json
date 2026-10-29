@@ -1,0 +1,5 @@
+{
+  "accounts": {
+    "claude": { "amount": 200, "currency": "USD" }
+  }
+}

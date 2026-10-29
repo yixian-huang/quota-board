@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-macOS 菜单栏里的剩余额度。读取这台机器上已经登录的 Claude、Codex、Cursor 和 Grok，也读取 `sub2api`、`new-api` 和 CPA 上的 Codex 账号。每张卡显示最紧的窗口还剩多少、何时重置，以及下一次账单日。
+macOS 菜单栏里的剩余额度。读取这台机器上已经登录的 Claude、Codex、Cursor 和 Grok，也读取 `sub2api`、`new-api` 和 CPA 上的 Codex 账号。点开后是一块深色屏：每张卡显示最紧的窗口还剩多少、何时重置，以及下一次账单日。
 
 额度接口是这些客户端自己在用的接口，字段并不稳定。读数失败时，卡片沿用上次成功的结果。
 
@@ -17,9 +17,18 @@ swift build --disable-sandbox
 "$(swift build --disable-sandbox --show-bin-path)/QuotaBoard"
 ```
 
-`--self-test` 只检查解析和排序，不打开菜单栏，也不访问网络。`--dump` 在终端打一次读数。最后一条命令让程序留在菜单栏里。
+面板用了 SwiftUI。只装 Command Line Tools 时，编译会报找不到 `SwiftUIMacros`。把开发者目录指到 Xcode 再执行上面的命令：
 
-菜单栏显示最快到期的那一档和剩余百分比。点开是卡片。平时每 5 分钟读一次，面板里的刷新立刻重读。程序没有程序坞图标。
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+export PATH="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin:$PATH"
+```
+
+`--self-test` 检查解析、排序、电平、剩余价值和重置预告文档，不打开菜单栏，也不访问网络。`--dump` 在终端打一次读数。最后一条命令让程序留在菜单栏里。
+
+菜单栏仍显示最快到期的那一档和剩余百分比，并跟随系统外观。点开是一块暖色底板上的深色屏。电平按剩余点亮，满条表示还没用；已用到 70% 转黄，90% 转红。平时每 5 分钟读一次额度，面板里的刷新立刻重读。程序没有程序坞图标。
+
+屏上有两个页。「剩余额度」可以在列表和图表之间换。列表是账号卡：名称、电平、备注，账单日在最后。同一时刻重置的窗口共用一条倒计时。图表把各账号排成电平桥，下面是对数刻度的重置时间轴；没有未来的重置时间时不画时间轴。「重置预告」目前是占位，不读取汇总服务。面板外观可以跟随系统、固定浅色或固定深色，只改这块面板。
 
 ## 本机登录
 
@@ -52,7 +61,23 @@ sub2api 用管理员 API Key，放在请求头 `x-api-key`。钥匙串里如果�
 
 `billing.json` 的键是账号标识，值是 `yyyy-MM-dd`。能自动读到的账单日：Cursor 用 `billingCycleEnd`，Grok 用 `billingPeriodEnd`，Codex 用订阅周期结束时间。Claude 没有。卡片菜单可以改；手动日期优先，清除后恢复自动读数。
 
-`accounts.json` 记录 Codex 的 `hidden`、`names` 和 `sort`。`sort` 取 `expiry` 或 `name`，缺省按到期排。名称最长 32 个字符。移除的账号刷新后也不会回来，从面板底部的「已隐藏」恢复。Claude、Cursor 和 Grok 的卡片菜单里只有账单日。
+`accounts.json` 记录 Codex 的 `hidden`、`names` 和 `sort`。`sort` 取 `expiry` 或 `name`，缺省按到期排。名称最长 32 个字符。移除的账号刷新后也不会回来，在列表底部的「已隐藏」里恢复。图表里只提示已隐藏的数量。Claude、Cursor 和 Grok 的卡片菜单里只有账单日。
+
+剩余价值用内置的美元月费。价格取各家 2026-10-29 前后公开的按月标价，不含税，也不用年付折扣。对得上套餐才显示；一张能算的卡都没有时，屏顶合计也不出现。价值是月费乘以最紧一档的剩余比例，显示时取整到元。
+
+| 平台 | 套餐 | 每月 |
+| --- | --- | --- |
+| Claude | Pro / Max 5x / Max 20x | $20 / $100 / $200 |
+| Codex | Go / Plus / Pro 100 / Pro 200 / Pro 500 | $8 / $20 / $100 / $200 / $500 |
+| Cursor、Grok | Plus / Premium / Super / Ultra | $8 / $30 / $100 / $200 |
+| Cursor 旧套餐 | Pro / Pro+ | $20 / $60 |
+| Grok 旧套餐 | SuperGrok | $30 |
+
+只写着 Max 的 Claude 卡不算，因为 Max 5x 和 Max 20x 价格不同。Team、Enterprise 和按席位分档的团队套餐也没有单一月费，同样不显示。Free 按 $0。
+
+`fees.json` 可以改掉内置价格。样例是 `fees.example.json`，把本机 Claude 标成 Max 20x 的 $200。`accounts` 的键和 `billing.json` 一样，优先于套餐价。`plans` 的键是套餐名：去掉首尾空白、转成小写、空格换成 `-`、`+` 换成 `-plus`。这里的套餐价不区分平台。数字表示美元。对象写成 `{"amount": 200, "currency": "USD"}`。
+
+重置预告这一页先占着，面板不会请求汇总服务。Quota Board 不直接读取 x.com。
 
 ## 发布
 
